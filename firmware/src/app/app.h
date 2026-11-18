@@ -1,0 +1,118 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Niagara Drift app: the project (everything that is saved) and the app's entry points. Included by the unity
+ * build after gfx.c (drawing helpers in scope) and by the host simulator. */
+#pragma once
+#include <stdint.h>
+#include "plat.h"
+#include "../dsp/drone.h"
+#include "../dsp/fastmath.h"            /* the UI's few float sums (the pitch in Hz) */
+
+#ifndef OM_VERSION                       /* a release build passes its own (tools/build.py --release) */
+#define OM_VERSION "DEV"
+#endif
+#define PROJ_MAGIC 0x314E5244u           /* "DRN1" */
+#define PROJ_FORMAT 44u                  /* 44: the LFO's depth on X-Wave and the resonance, 100 their whole range
+                                          * (43's read, converted to the same range);
+                                          * 43: the LFO rate 0..152, every second from 100 s to 10 s (41's and 42's
+                                          * read, converted);
+                                          * 42: the LFO rate to 100 s, a power curve (a test build of #78);
+                                          * 41: Tune in Hz, Sync (112 values; 39-40's widened, Tune converted);
+                                          * 40: the Tunings reordered, simplest to richest (39's read, remapped);
+                                          * 39: the pitch knobs' Tuning (111 values; 38's widened);
+                                          * 38: the Swell's Shape the other way round (37's read, negated);
+                                          * 37: each drone's sub wave (110 values; 36's widened);
+                                          * 36: the pressure keys' gestures' latches (108; 35's widened); scenes 9-12 moved
+                                          * to keys 1-8, P9-P12 copied into the banks (keys 9-12 are gestures);
+                                          * 35: the LFO's, the delay's and the scenes' clock values (104; 34's widened);
+                                          * 34: the Swell's division (101 values; 33's read and widened);
+                                          * 33: the delay types reordered, the reverb's route (100 values; 32's
+                                          * read, widened and converted);
+                                          * 32: the delay's drive (99 values a sound; 23-31's read and widened);
+                                          * 31: Level an audio taper (30's levels to 10 sqrt(v));
+                                          * 30: Tuning in each Interval (the interval and Tuning to one index);
+                                          * 29: the gesture keys fixed (Weight, Shift, Clean, Wash; 28's latches
+                                          * let go, a key may play something else now); 28: Shift's move in cents (27's four to theirs); Noise's top
+                                          * 6 dB up (27's values halved);
+                                          * 27: the set macros gone (their four values zeroed; now Wander, Age,
+                                          * Shift's move); what each gesture key plays; 26: Gesture time (the byte of the macro PRESETS played: 25's reset);
+                                          * 25: the gestures' swells shorter (24's reset to the new defaults);
+                                          * 24: the gestures Weight, Shift, Converge, Wash (23's gesture values
+                                          * reset: Beat and Heat are gone); 23: the effects (delay type, reverb length and damp, pressure; 19-22
+                                          * are read and converted); 22: the macros (16 values more a sound; 19-21 are read and converted);
+                                          * 21: scenes in banks: A (12) here, B and C in their own objects (v0.2;
+                                          * 19 and 20 are read and converted: scenes 13-16 become B1-B4);
+                                          * 20: the noise Colour a blend 0..100; 19: the Swell's Depth in dB (18: noise,
+                                          * 17: cutoff / resonance 0..1000, 16: Feedback, Character, 15: Movement, 14: tuning,
+                                          * speaker, pitch lock, subharmonics, 13: gliding knobs, Scene time, 12: Morph, 11:
+                                          * the LFO rate mod, 10: the LFO lock, 9: the filter LFO's destination, 8: the
+                                          * effects, 7: the pulse, 6: scenes) */
+#define NSCENES 12                       /* a bank's slots: the 12 lower white keys (F3 .. C5, which sense pressure) */
+#define NPLAY 8                          /* ... the scenes it plays: keys 1-8 (F3 .. F4); 9-12 are gestures (v0.3) */
+#define NBANKS 8                         /* the banks, by number: A, B, C (yours), the Presets (P1-P8, fixed, in the
+                                          * firmware), D, E, F (yours, v0.3), the Presets' second bank (P9-P16): numbered
+                                          * so a project from before keeps its bank (3 the Presets); on the keys in a
+                                          * row, A .. F, P1-P8, P9-P16 (ui.c KEY_BANK) */
+#define BANK_PRESETS 3
+#define BANK_PRESETS2 7
+#define BANK_D 4                         /* D, E, F: 4, 5, 6 (their own flash objects, 8 scenes each) */
+#define BANK_IS_PRESETS(b) ((b) == BANK_PRESETS || (b) == BANK_PRESETS2)
+#define PRESET_LOCKED 15                 /* P16, the bare sound */
+
+typedef struct {
+    uint32_t magic, format;
+    int16_t par[DR_NPARAMS];             /* drone.h parameters */
+    uint8_t leds;                        /* key lights on */
+    uint8_t bank;                        /* the bank the scene keys play (0 A .. 3 Presets) */
+    uint8_t mtime;                       /* GESTURE TIME, 0..100 (PRESETS): every gesture's time x0.25 .. x12, 50 as set
+                                          * (the player's, not a scene's; was the macro PRESETS played, format <= 25) */
+    uint8_t gkey_old[4];                 /* unused since 29 (what each gesture key played, 27-28) */
+    uint8_t seen[2];                     /* the one-time tips shown (bit TIP_*; v0.3): the player's, not a scene's */
+#define SEEN1_MOVED 0x37u                /* seen[1]: the tips on 0.3's moved knobs (TIP_KN_*, 8-10, 12-13): a new FM-1
+                                          * never had them where 0.2 did, so they start seen */
+    int8_t tun_off[3];                   /* each pitch knob's offset off the Tuning's grid, cents (SEL's fine tuning; drone
+                                          * I, drone II, the link offset; v0.3): the player's, not a scene's */
+    uint8_t rsv[4];                      /* room to grow: an older, shorter project loads (zeros here) */
+    uint16_t scene_used;                 /* bank A: bit n, scene n holds a sound */
+    int16_t scene[NSCENES][DR_NPARAMS];  /* bank A: every parameter, recalled but for the room's settings */
+} project_t;
+_Static_assert(sizeof(project_t) <= PLAT_STORE_MAX, "the project must fit one flash object");
+
+typedef struct {                         /* banks B and C, and the Presets saved over (before 2026-10-19): an object each */
+    uint32_t magic, format;
+    uint16_t used;
+    uint16_t rsv;
+    int16_t scene[NSCENES][DR_NPARAMS];
+} bank_t;
+_Static_assert(sizeof(bank_t) <= PLAT_STORE_MAX, "a bank must fit one flash object");
+typedef struct {                         /* banks D, E, F (v0.3): an object each, keys 1-8 only (9-12 are gestures) */
+    uint32_t magic, format;
+    uint16_t used;
+    uint16_t rsv;
+    int16_t scene[NPLAY][DR_NPARAMS];
+} bank8_t;
+_Static_assert(sizeof(bank8_t) <= PLAT_STORE_MAX, "a bank must fit one flash object");
+#define MTIME_DEF 50                     /* Gesture time to start: the gestures' own swells */
+#define BANK_MAGIC 0x314B4E42u           /* "BNK1" */
+
+extern project_t proj;
+
+void project_defaults(void);
+int project_load(void);                  /* 0 = loaded; else defaults are in place */
+int project_save(void);                  /* 0 = saved and verified */
+extern int proj_note_moved, proj_note_stored, proj_note_presets;   /* the load's moves for 0.3's keys 9-12 */
+int scene_has(int bank, int n);                 /* scene n of a bank holds a sound */
+const int16_t *scene_get(int bank, int n);   /* scene n of a bank, or 0 if empty (a Preset's: until another is asked for) */
+const char *preset_name(int n);          /* the Preset's name (P1 "NIAGARA" ..) */
+int scene_put(int bank, int n);         /* the sound now into scene n of a bank of yours (marks it to save); 0 ok */
+void project_apply(void);                /* every value to the engine (boot, load) */
+
+void ui_init(void);
+void ui_frame(void);
+void ui_input_only(void);
+int ui_dirty(void);
+void ui_clock_stats(uint32_t w[8]);   /* the MIDI clock in: tempo x 100, jitter RMS / largest (us), pulses, Starts,
+                                       * Continues, Stops, ms since the last pulse (tools/fm1_clock.py) */
+void ui_say(const char *a, const char *b);
+void ui_restore_ask(void);              /* the safe restore (main_fm1.c): RESTORE FROM USB? on the screen, SEL / HOME */
+int ui_restore_answer(void);            /* 0 waiting, 1 yes, 2 no (HOME, or a minute without either); asks no more */
+void ui_restore_said(int ok);           /* the banner after: 1 restored, 0 failed, -1 not */

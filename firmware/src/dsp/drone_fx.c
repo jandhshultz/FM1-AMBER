@@ -1,0 +1,828 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
+/* Niagara Drift's effects: the drones -> a stereo DELAY -> a DRIVE -> a REVERB, with a dry/wet mix for each. Included by
+ * drone.c (one compilation unit); uses its parameters, its LFO and its helpers. Float only, no libm
+ * (fastmath.h). They run while the drone is stopped too, so tails ring out.
+ *
+ * The design of both is ChoralRoot's (Quixotic7's ChoralRootFM1, GPL-3.0-only: firmware/src/cr_fx.c and
+ * docs/FX.md), after the Moog Matriarch's delay and a Jot / Stautner-Puckette feedback delay network; written
+ * anew here in float for this engine (ChoralRoot's is fixed point). LICENSING.md has the row.
+ *
+ * DELAY: two lines, L and R (int16, 743 ms each, in the .pool RAM). Each side reads between two samples at a
+ * time that glides to its target (~50 ms: turning TIME bends the repeats' pitch, as tape does) plus the WOW (a
+ * slow and a faster sine, the same on both sides) and the LFO's tap (+-25 % of the time). The loop: the read ->
+ * a soft clip at the REPEATS gain -> a low-pass (the type's tone) -> a low cut (~80 Hz) -> back in with the
+ * input. Past ~85 Repeats runs away into self-oscillation, held by the clip. SIX TYPES, each a set of the
+ * mode, the right side's time against the left's, the tone and the wow (gliding from one to the next):
+ *   Tape       both sides alike (mono), warm, a gentle wow: 0.1's delay
+ *   Wide       stereo, the right at 3/4 of the left's time, a little brighter, a light wow
+ *   Ping-pong  the input into the left; left feeds right and right left
+ *   Clean      bright, no wow (just tuning stays still)
+ *   Grain      Tape whose time its own sound shakes (~280 Hz and under, 60 samples a unit): grainy, metallic
+ *              echoes, wilder as they ring (v0.3, the Lyra-8's SELF)
+ *   Self       Tape whose time its own loudness stretches (followed at ~3 Hz, against its slow mean): loud
+ *              echoes sag and wobble, a runaway lurches (v0.3)
+ *
+ * DRIVE (v0.3, after the Lyra-8, whose distortion comes after its delay): the drones and their repeats into one soft
+ * clip, so they distort together (ghost notes, beating, crackle on the repeats). Its knob blends it in over the first
+ * fifth (a little drive, mixed in) and then drives harder, up to 26 dB into the clip; a little bias gives it even
+ * harmonics as well (taken back out with the DC, ~5 Hz). The loudness is held: the clipped sound is turned to the
+ * level of what went in, followed over ~0.3 s (so the Swell and the LFO's slow moves keep their size).
+ *
+ * REVERB: a feedback delay network of eight lines mixed by an 8 x 8 Hadamard matrix, behind a low cut, a
+ * pre-delay and four all-pass diffusers, at half the rate (22.05 kHz, between two half-band filters). Each
+ * line: a read at its length (SIZE; four of them swing on slow sines, MOD), a low-pass (DAMP) and the gain that
+ * gives every line the same decay time (LENGTH: 0.3 .. 40 s, 100 "Inf": a freeze; at Inf the damping is out of
+ * the loop, so what's in it stays). Out: four lines a side with alternating signs. FOUR TYPES set the size,
+ * pre-delay, swing, low cut and width: Room, Hall, Cathedral, Chorus hall (a wide swing). A new type moves its
+ * lines (and the pre-delay) to their new lengths at once, each read at both for 200 ms and crossfaded: no fade, no
+ * clearing, no pitch bend (v0.3; they glided, and the tail bent by up to 7 semitones, going round as it did). Stopped, an Inf tail fades over about twice the Fade time. */
+
+#ifdef OM_HOST
+#define DR_POOL
+#else
+#define DR_POOL __attribute__((section(".pool")))
+#endif
+
+static uint32_t fx_quiet;                /* blocks the effects' output has been silent (dr_render rests them) */
+
+/* ------------------------------------------------------------- drive --- */
+#define DRV_BIAS 0.2f
+static float drv_m, drv_k = 1.0f;       /* the blend and the gain into the clip, as they ended the last block */
+static float drv_g = 1.0f, drv_pi, drv_pw;   /* the level matching: its gain, the powers in and clipped (followed) */
+static float drv_dc[2];                  /* the bias's DC, each side */
+static void drive_run(float *l, float *r, uint32_t n)
+{
+    const float v = pfs[P_DLY_DRIVE] * 0.01f;
+    const float m1 = fm_minf(v * 5.0f, 1.0f), k1 = fm_exp2f(v * 4.32192809f);   /* 20^v: up to 26 dB */
+    const float dn = 1.0f / (float)(n ? n : 1u), dm = (m1 - drv_m) * dn, dk = (k1 - drv_k) * dn;
+    const float s0 = sat(DRV_BIAS), a = fm_minf((float)n / (0.3f * DR_SR), 1.0f);
+    float m = drv_m, k = drv_k, pi = 0.0f, pw = 0.0f, g0 = drv_g, dg;
+    uint32_t j;
+    if (m1 <= 0.0f && drv_m <= 0.0f) {   /* off: nothing to do (and the matching ready for next time) */
+        drv_g = 1.0f;
+        drv_pi = drv_pw = 0.0f;
+        drv_dc[0] = drv_dc[1] = 0.0f;
+        return;
+    }
+    for (j = 0; j < n; j++) {            /* the powers this block, for the gain at its end */
+        float xl = l[j], xr = r[j], yl = sat((k + dk * (float)j) * xl + DRV_BIAS) - s0,
+              yr = sat((k + dk * (float)j) * xr + DRV_BIAS) - s0;
+        pi += xl * xl + xr * xr;
+        pw += yl * yl + yr * yr;
+    }
+    drv_pi += (pi - drv_pi) * a;
+    drv_pw += (pw - drv_pw) * a;
+    drv_g = drv_pw > 1e-12f ? fm_clampf(fm_sqrtf(drv_pi / drv_pw), 0.02f, 1.0f) : drv_g;
+    dg = (drv_g - g0) * dn;
+    for (j = 0; j < n; j++) {
+        float yl, yr;
+        m += dm;
+        k += dk;
+        g0 += dg;
+        yl = sat(k * l[j] + DRV_BIAS) - s0;
+        yr = sat(k * r[j] + DRV_BIAS) - s0;
+        drv_dc[0] += (yl - drv_dc[0]) * 0.0007f;   /* ~5 Hz */
+        drv_dc[1] += (yr - drv_dc[1]) * 0.0007f;
+        l[j] += ((yl - drv_dc[0]) * g0 - l[j]) * m;
+        r[j] += ((yr - drv_dc[1]) * g0 - r[j]) * m;
+    }
+    drv_m = m1;
+    drv_k = k1;
+}
+
+/* ------------------------------------------------------------- delay --- */
+/* the line is kept at half the rate (Evan, 2026-10-25: up to ~1.5 s in the memory 0.74 s took): the loop runs at the
+ * full rate, what it writes goes down through a half-band (flat to 9.5 kHz) and is read back up with a 4-point cubic.
+ * DLY_N half-rate samples: 1.86 s, the longest Time (1.46 s) with the LFO's 25 % and the wow */
+#define DLY_N 40960u
+static int16_t dly_buf[2][DLY_N] DR_POOL;
+static uint32_t dly_w;                   /* the next half-rate sample to write */
+static uint8_t dly_odd;                  /* a full-rate sample in hand (the first of a pair) */
+static float dly_in[2];                  /* ... it, left and right */
+
+static float dly_t = 0.177f * DR_SR;    /* the left's time, in samples, smoothed */
+static float dly_kt = 0.177f * DR_SR;    /* the knob's time, in samples, moving at most 0.5 a sample (below) */
+volatile float dr_dly_ms;               /* ... in ms, each block (the host's probe) */
+static float dly_lp[2], dly_hp[2], dly_olp[2];
+static float dly_ph1, dly_ph2;           /* the wow's two sines */
+enum { DT_CLEAN, DT_WIDE, DT_PING, DT_TAPE, DT_GRAIN, DT_SELF, DT_NTYPES };   /* plain to most alive (Evan, 2026-10-25) */
+_Static_assert(DT_NTYPES == DR_NDLY, "a name for each type");
+typedef struct {
+    float spread, tone, out, wow, ping;  /* R's time / L's; the loop's low-pass k; the wet's low-pass k; the wow,
+                                          * samples of swing; ping-pong 0 .. 1 */
+    float gain;                          /* the wet's level: the types as loud as each other (measured on a drone) */
+    float grain, self;                   /* its own sound moving its time: samples a unit (Grain); its loudness,
+                                          * the time's share a unit (Self) */
+} dly_type_t;
+static const dly_type_t DLY_TYPE[DT_NTYPES] = {
+    {1.00f, 0.86f, 1.00f, 0.0f, 0.0f, 1.08f, 0.0f, 0.0f},     /* CLEAN: ~14 kHz, nothing out */
+    {0.75f, 0.57f, 0.70f, 14.0f, 0.0f, 1.15f, 0.0f, 0.0f},    /* WIDE: ~6 kHz, ~8.5 kHz */
+    {1.00f, 0.50f, 0.66f, 14.0f, 1.0f, 1.66f, 0.0f, 0.0f},    /* PING-PONG: each repeat on one side (3 dB of it) */
+    {1.00f, 0.39f, 0.51f, 30.0f, 0.0f, 1.00f, 0.0f, 0.0f},    /* TAPE: ~3.5 kHz in the loop, ~5 kHz out, 0.7 ms of wow */
+    {1.00f, 0.39f, 0.51f, 30.0f, 0.0f, 1.00f, 60.0f, 0.0f},   /* GRAIN: Tape, shaken by its own sound */
+    {1.00f, 0.39f, 0.51f, 30.0f, 0.0f, 1.00f, 0.0f, 0.25f},   /* SELF: Tape, stretched by its own loudness */
+};
+static dly_type_t dly_c = {1.00f, 0.39f, 0.51f, 30.0f, 0.0f, 1.00f, 0.0f, 0.0f};   /* the type as it glides */
+/* where a type reads (its spread, wow, Grain's and Self's moves) changes at once on a new type, each side read at
+ * the old type's place and the new one's for 50 ms and crossfaded (Evan, 2026-10-24: a glide of the places bent the
+ * repeats' pitch, as the reverb's did); the rest of the type (tone, out, ping-pong, gain) glides */
+#define DLY_XSTEP (1.0f / (0.05f * DR_SR))
+static uint8_t dly_pt = DT_TAPE, dly_qt = DT_TAPE;   /* the type read now, and the one it's coming from */
+static float dly_xf = 1.0f;                          /* that crossfade, 0..1 (1: done) */
+/* ... but Grain's and Self's moves of the time ease in and out over a second (Evan, 2026-10-25: a loud Self moves it
+ * by milliseconds, and switched in or out within 50 ms that sang as a swoop) */
+#define DLY_MSTEP (1.0f / (1.0f * DR_SR))
+static float dly_ga, dly_sa;                         /* Grain's amount now, Self's */
+/* what goes into the reverb (P_DLY_ROUTE): both the drones and their echoes, the echoes alone (the drones dry, the
+ * wash added to them), or the drones alone (the reverb beside the delay, the echoes dry). Each route's send and
+ * its share of the dry: a new route crossfades to them over 50 ms */
+static float rt_w[DR_NROUTE] = {1.0f, 0.0f, 0.0f};
+static void rt_snap(void)                /* at the route at once (a load, at rest) */
+{
+    int q;
+    for (q = 0; q < DR_NROUTE; q++)
+        rt_w[q] = q == ((unsigned)par[P_DLY_ROUTE] < DR_NROUTE ? par[P_DLY_ROUTE] : 0) ? 1.0f : 0.0f;
+}
+static float self_s, self_e, self_e2, self_es;    /* Grain's sound (~280 Hz); Self's loudness (~3 Hz) and its mean (~0.2 Hz) */
+
+static float dly_ms(int v) { return 70.0f * fm_exp2f((float)v * 0.026845f); }   /* 70 * (450/70)^(v/100) */
+/* on a MIDI clock (v0.3): the time a note value of the tempo (P_DLY_NOTE), halved till the line holds it; the tempo
+ * steadied for it (a change over 0.4 % sets it gliding, till within 0.05 %): a wobbly clock's tempo would bend the
+ * echoes */
+static float dly_spb;
+static uint8_t dly_sgo;                  /* gliding to a new tempo: till within 0.05 % */
+static float dly_ms_now(void)
+{
+    float ms, d;
+    if (dr_ext_spb <= 0.0f)
+        return dly_ms(par[P_DLY_TIME]);
+    if (dly_spb <= 0.0f)
+        dly_spb = dr_ext_spb;
+    d = fm_fabsf(dr_ext_spb - dly_spb);
+    if (d > 0.004f * dly_spb)
+        dly_sgo = 1;
+    else if (d < 0.0005f * dly_spb)
+        dly_sgo = 0;
+    if (dly_sgo)
+        dly_spb += (dr_ext_spb - dly_spb) * 0.05f;
+    ms = DR_NOTE_BEATS[(unsigned)par[P_DLY_NOTE] < DR_NNOTE ? par[P_DLY_NOTE] : 5] * dly_spb * (1000.0f / DR_SR);
+    while (ms > dly_ms(DR_DLY_TMAX))
+        ms *= 0.5f;
+    return fm_maxf(ms, dly_ms(0));
+}
+
+/* the read: 8 taps of a windowed sinc (Kaiser, beta 6, cut at 0.46 of the half rate: flat to ~8 kHz, as far as the
+ * half-band lets through), the nearest of 128 phases (its timing within 0.18 us: its error > 60 dB under at 1 kHz).
+ * A cubic rolled off above ~5 kHz, again with each repeat */
+#include "dly_kernel.h"                 /* dly_k: fixed numbers, in the firmware (2026-10-26: 4 KB of RAM back) */
+static inline int32_t dly_wrap(int32_t i) { return i < 0 ? i + (int32_t)DLY_N : i >= (int32_t)DLY_N ? i - (int32_t)DLY_N : i; }
+static inline float dly_read(const int16_t *b, float d)   /* d full-rate samples back */
+{
+    float p = (float)dly_w - 5.0f + 0.5f * ((float)dly_odd - d), f, y = 0.0f;
+    int32_t i, t, ph;
+    if (p < 0.0f)
+        p += (float)DLY_N;
+    i = (int32_t)p;
+    f = (p - (float)i) * (float)DLY_PH + 0.5f;
+    ph = (int32_t)f;                     /* the nearest phase (DLY_PH: the next sample's first, as made) */
+    i -= DLY_TAPS / 2 - 1;
+    if (i >= 0 && i + DLY_TAPS <= (int32_t)DLY_N) {
+        const int16_t *q = b + i;
+        const float *k = dly_k[ph];
+        for (t = 0; t < DLY_TAPS; t++)
+            y += (float)q[t] * k[t];
+    } else {
+        for (t = 0; t < DLY_TAPS; t++)
+            y += (float)b[dly_wrap(i + t)] * dly_k[ph][t];
+    }
+    return y * (1.0f / 16384.0f);
+}
+#define DLY_DMAX (2.0f * (float)DLY_N - 16.0f)   /* the farthest back it reads, full-rate samples */
+
+/* ------------------------------------------------------------ reverb --- */
+/* SHIMMER (v0.3; Evan's pick, 2026-11-10, "L"): the reverb's input, low-passed, an octave up, mixed with the input
+ * (the octave 1.6, the drones cut to 0.4: mostly halo) into a hall: one clean octave over whatever is playing, any
+ * note or chord, that rings as long as the reverb's Length. Nothing feeds back (the first Shimmer fed the octave back
+ * into the reverb, each pass climbing another: "dissonant ... a little menacing"). The shift: two pairs of reads of a
+ * short line, each pair sweeping at about twice the write's speed and crossfaded with sin^2 windows (46 ms windows
+ * of 1024 at 22.05 kHz); one pair 7 cents sharp of the octave, the other 7 flat, so each harmonic of the halo swells
+ * and fades on its own, the highest fastest: the sparkle (20 cents apart was out of tune; 8, too tame). It washes
+ * in over 8 s and out over 6 ("it should wash in and out") */
+#define SH_GAIN 1.6f                             /* the octave into the reverb (the two pairs, part cancelling) */
+#define SH_DRY 0.6f                              /* how much of the drones it takes out of the reverb's input */
+#define SH_IN_S 8.0f                             /* the wash in, s */
+#define SH_OUT_S 6.0f                            /* and out */
+#define SH_LP_K 0.55f                            /* the low pass before the shift: ~2.9 kHz at 22.05 kHz, two poles */
+#define SH_DET 14.0f                             /* the two pairs' gap, cents */
+#define SH_N 2048u
+#define SH_W 1024.0f
+static float sh_buf[SH_N];                       /* main RAM, 8 KB */
+static struct { uint32_t w; float ph, ph2, lp1, lp2, amt; } sh;   /* amt: the wash, 0 .. 1 */
+static inline float sh_read(float d)             /* d samples back, linear */
+{
+    float p = (float)sh.w - 2.0f - d, f;
+    uint32_t k;
+    if (p < 0.0f)
+        p += (float)SH_N;
+    k = (uint32_t)p;
+    f = p - (float)k;
+    return sh_buf[k & (SH_N - 1u)] * (1.0f - f) + sh_buf[(k + 1u) & (SH_N - 1u)] * f;
+}
+static inline float sh_pair(float *ph, float step)
+{
+    float d1, d2, s1, s2;
+    *ph -= step;                                 /* the read gains ~a sample a tick on the write: twice the speed */
+    if (*ph < 0.0f)
+        *ph += SH_W;
+    d1 = *ph;
+    d2 = d1 + SH_W * 0.5f;
+    if (d2 >= SH_W)
+        d2 -= SH_W;
+    s1 = fm_sin_turns(d1 * (0.5f / SH_W));
+    s2 = fm_sin_turns(d2 * (0.5f / SH_W));
+    return sh_read(d1) * s1 * s1 + sh_read(d2) * s2 * s2;
+}
+static inline float sh_tick(float x)
+{
+    /* each pair's step past the write: 2 * 2^(+-c/1200) - 1, to first order */
+    static const float up = 2.0f * (1.0f + SH_DET * 0.5f * 0.000577623f) - 1.0f, dn = 2.0f * (1.0f - SH_DET * 0.5f * 0.000577623f) - 1.0f;
+    float y;
+    sh.lp1 += (x - sh.lp1) * SH_LP_K;
+    sh.lp2 += (sh.lp1 - sh.lp2) * SH_LP_K;
+    sh_buf[sh.w] = fm_flush(sh.lp2);
+    y = 0.5f * (sh_pair(&sh.ph, up) + sh_pair(&sh.ph2, dn));
+    sh.w = (sh.w + 1u) & (SH_N - 1u);
+    return y;
+}
+enum { RV_ROOM, RV_HALL, RV_CATHEDRAL, RV_CHORUS_HALL, RV_SHIMMER, RV_NTYPES };
+typedef struct {
+    float size, pre_ms, mod, lowcut, width;   /* the lines' lengths x; pre-delay; the swing, samples at 22.05 kHz;
+                                               * the input's low cut, Hz; 0 mono .. 1 */
+    float gain;                               /* the wet's level: the types as loud as each other (measured) */
+} rv_type_t;
+static const rv_type_t RV_TYPE[RV_NTYPES] = {
+    {0.35f, 4.0f, 2.0f, 120.0f, 0.8f, 0.80f},    /* ROOM: small, close */
+    {0.75f, 18.0f, 5.0f, 90.0f, 0.9f, 0.93f},    /* HALL */
+    {1.00f, 42.0f, 7.0f, 60.0f, 0.85f, 1.00f},   /* CATHEDRAL: the largest, the furthest */
+    {0.85f, 24.0f, 18.0f, 90.0f, 1.0f, 1.45f},   /* CHORUS HALL: a hall whose lines swing wide (they cancel a little) */
+    {0.75f, 18.0f, 5.0f, 90.0f, 0.9f, 0.93f},    /* SHIMMER: the Hall, its input an octave up (sh_tick), so a switch
+                                                 * between them changes only the halo */
+};
+#define RV_FS (DR_SR * 0.5f)
+/* the eight lines at size 1, samples at 22.05 kHz (57 .. 125 ms; primes, ~1.12 from one to the next:
+ * ChoralRoot's), each in its own stretch of one array with room for the swing and the interpolator */
+static const uint16_t RV_LEN[8] = {1259, 1433, 1607, 1801, 2003, 2221, 2477, 2767};
+#define RV_GUARD 24u
+#define RV_XSTEP (1.0f / (0.2f * RV_FS))    /* a new type's crossfade: 200 ms (50 jumped up to 6 dB leaving the
+                                             * Cathedral, v0.3) */
+#define RV_CAP (1259u + 1433u + 1607u + 1801u + 2003u + 2221u + 2477u + 2767u + 8u * RV_GUARD)
+static float rv_mem[RV_CAP] DR_POOL;
+#define RV_PRE_N 2048u                   /* the pre-delay: 92 ms at 22.05 kHz */
+static float rv_pre[RV_PRE_N] DR_POOL;
+static const uint16_t RV_AP[4] = {113, 173, 263, 397};   /* the diffusers: 5.1 .. 18 ms */
+#define RV_AP_CAP (113u + 173u + 263u + 397u)
+static float rv_apm[RV_AP_CAP] DR_POOL;
+typedef struct { float x[4], y[4]; } hb_t;   /* a half-band filter: two paths of two first-order all-passes */
+static struct {
+    float *line[8], *ap[4];
+    uint32_t cap[8], pos[8], app[4], pw;
+    float cur[8];                        /* each line's length now (its size) */
+    float xd[8], pxd, xf;                /* a new type: each line's old length less its new, the pre-delay's; the
+                                          * crossfade from the old reads to the new, 0..1 (1: done) */
+    float d[8], dd[8], pdd;              /* this block: each line's read now and its step a tick (the glide and
+                                          * the swing, worked out once a block), the pre-delay's step */
+    float lp[8], g[8], dk, ig;           /* the damping's states, the lines' gains, damp's k, the input gain */
+    float h0, h1, lk;                    /* the low cut (two poles) and its k */
+    float pre, mod, width, gain;         /* the pre-delay now (samples), the swing, the width, the level: gliding */
+    float mph[4];                        /* the four swings' phases */
+    hb_t dn, up[2];
+    float hold[2];                       /* an odd block's last sample: the wet of the one before */
+    int ready;
+} rv;
+_Static_assert((RV_PRE_N & (RV_PRE_N - 1u)) == 0, "a power of two: a mask");
+
+static void rv_layout(void)
+{
+    float *m = rv_mem, *a = rv_apm;
+    uint32_t i;
+    for (i = 0; i < 8u; i++) {
+        rv.line[i] = m;
+        rv.cap[i] = RV_LEN[i] + RV_GUARD;
+        m += rv.cap[i];
+    }
+    for (i = 0; i < 4u; i++) {
+        rv.ap[i] = a;
+        a += RV_AP[i];
+    }
+}
+
+/* the half-band all-passes (ChoralRoot's tools/fx_halfband.py: -54 dB above 12.5 kHz, flat to 9.5 kHz) */
+#define HB_A0 (199.0f / 2048.0f)
+#define HB_A1 (1264.0f / 2048.0f)
+#define HB_A2 (695.0f / 2048.0f)
+#define HB_A3 (1785.0f / 2048.0f)
+static inline float hb_ap(hb_t *h, int k, float a, float x)
+{
+    float y = a * (x - h->y[k]) + h->x[k];
+    h->x[k] = x;
+    h->y[k] = y;
+    return y;
+}
+static hb_t dly_dn[2];                   /* the delay's line down to half rate, left and right */
+
+static float rv_rt60(int v)              /* LENGTH -> seconds; 100: Inf (0) */
+{
+    return v >= 100 ? 0.0f : 0.3f * fm_exp2f((float)v * 0.070607f);   /* 0.3 * (40/0.3)^(v/99) */
+}
+static float onepole_k(float hz, float fs) { return 1.0f - fm_exp2f(-6.2831853f * 1.442695f * hz / fs); }
+
+static float fx_g[5];                            /* the repeats' and mixes' gains where the last block ended */
+/* REPEATS: the loop's gain, 1.15 at 100 before its losses (the soft clip, the tone, the 80 Hz cut); over 85,
+ * where the screen says "runaway", a little more, so the top sings into runaway on a low drone too */
+static float rep_g(float v) { return v * 0.0115f + fm_maxf(v - 85.0f, 0.0f) * 0.006f; }
+static void fx_gains(void)                       /* ... where they're set: no ramp from nothing */
+{
+    fx_g[0] = rep_g(pfs[P_DLY_REPEATS]);
+    fx_g[1] = fm_sqrtf(1.0f - pfs[P_DLY_MIX] * 0.01f);
+    fx_g[2] = fm_sqrtf(pfs[P_DLY_MIX] * 0.01f);
+    fx_g[3] = fm_sqrtf(1.0f - pfs[P_REV_MIX] * 0.01f);
+    fx_g[4] = fm_sqrtf(pfs[P_REV_MIX] * 0.01f);
+}
+
+/* the reverb's coefficients for this block: the gains from LENGTH (Inf while playing; stopped, a freeze lets go
+ * over about twice the Fade time, at least 1.5 s), damp's k, the input gain; the type's pre-delay, swing and width glide */
+static void rv_coefs(float ease)
+{
+    const rv_type_t *t = &RV_TYPE[(unsigned)par[P_REV_TYPE] < RV_NTYPES ? par[P_REV_TYPE] : RV_CATHEDRAL];
+    float rt = rv_rt60(par[P_REV_LEN]), fsec, e;
+    int inf = rt <= 0.0f;
+    uint32_t i;
+    if (inf && fade_target <= 0.0f) {   /* stopped or stopping: a freeze lets go, over about twice the Fade */
+        fsec = fm_maxf(2.0f * dr_time_s(P_FADE, par[P_FADE]), 1.5f);
+        rt = fsec;
+        inf = 0;
+    }
+    for (i = 0; i < 8u; i++) {           /* g = 10^(-3 L / (RT60 fs)) */
+        float g = inf ? 0.99988f : fm_exp2f(-9.965784f * rv.cur[i] / (rt * RV_FS));
+        rv.g[i] += (g - rv.g[i]) * ease;
+    }
+    {
+        float v = (float)par[P_REV_DAMP], k = v <= 0.0f || inf ? 1.0f
+                                                    : onepole_k(12000.0f * fm_exp2f(-v * 0.0418f), RV_FS);
+        rv.dk += (k - rv.dk) * ease;
+    }
+    e = 1.0f - rv.g[4] * rv.g[4];        /* the input's gain: (1 - g^2)^(1/4), so a long tail isn't louder */
+    rv.ig = fm_sqrtf(fm_sqrtf(fm_maxf(e, 0.0f)));
+    rv.lk = onepole_k(t->lowcut, RV_FS);
+    rv.mod += (t->mod - rv.mod) * ease;
+    rv.width += (t->width - rv.width) * ease;
+    rv.gain += (t->gain - rv.gain) * ease;
+}
+
+static void rv_clear(void)
+{
+    uint32_t i;
+    rv_layout();
+    for (i = 0; i < RV_CAP; i++)
+        rv_mem[i] = 0.0f;
+    for (i = 0; i < RV_AP_CAP; i++)
+        rv_apm[i] = 0.0f;
+    for (i = 0; i < RV_PRE_N; i++)
+        rv_pre[i] = 0.0f;
+    {
+        const rv_type_t *t = &RV_TYPE[(unsigned)par[P_REV_TYPE] < RV_NTYPES ? par[P_REV_TYPE] : RV_CATHEDRAL];
+        for (i = 0; i < 8u; i++) {
+            rv.cur[i] = rv.d[i] = (float)(uint32_t)((float)RV_LEN[i] * t->size);
+            rv.pos[i] = 0;
+            rv.lp[i] = 0.0f;
+            rv.g[i] = 0.0f;
+        }
+        rv.pre = t->pre_ms * 0.001f * RV_FS;
+        rv.xf = 1.0f;
+        rv.pxd = 0.0f;
+        for (i = 0; i < 8u; i++)
+            rv.xd[i] = 0.0f;
+        rv.mod = t->mod;
+        rv.width = t->width;
+        rv.gain = t->gain;
+    }
+    for (i = 0; i < 4u; i++)
+        rv.app[i] = 0;
+    rv.pw = 0;
+    rv.h0 = rv.h1 = 0.0f;
+    rv.dk = 1.0f;
+    {
+        static const hb_t z;
+        rv.dn = rv.up[0] = rv.up[1] = z;
+    }
+    rv.hold[0] = rv.hold[1] = 0.0f;
+    rv_coefs(1.0f);
+    rv.ready = 1;
+}
+
+/* this block's ramps, nt ticks: a new type's lengths (the lines', the pre-delay's) at once, crossfaded from the old
+ * over 200 ms (a turn through several: one after the other); the odd four swing (their slow sines worked out at the
+ * block's ends) */
+static void rv_block(uint32_t nt, float dt)
+{
+    const rv_type_t *t = &RV_TYPE[(unsigned)par[P_REV_TYPE] < RV_NTYPES ? par[P_REV_TYPE] : RV_CATHEDRAL];
+    static const float MR[4] = {0.31f, 0.43f, 0.57f, 0.71f};   /* the swings, Hz */
+    const float inv = nt ? 1.0f / (float)nt : 0.0f, pt = t->pre_ms * 0.001f * RV_FS;
+    uint32_t i;
+    for (i = 0; i < 4u; i++)
+        rv.mph[i] = advance(rv.mph[i], MR[i] * dt);
+    if (rv.xf >= 1.0f && fm_fabsf((float)(uint32_t)((float)RV_LEN[0] * t->size) - rv.cur[0]) > 0.5f) {
+        for (i = 0; i < 8u; i++) {           /* a new type: there now, the old reads fading out */
+            float tl = (float)(uint32_t)((float)RV_LEN[i] * t->size);
+            rv.xd[i] = rv.cur[i] - tl;
+            rv.cur[i] = tl;
+            rv.d[i] -= rv.xd[i];
+        }
+        rv.pxd = rv.pre - pt;
+        rv.pre = pt;
+        rv.xf = 0.0f;
+    }
+    for (i = 0; i < 8u; i++) {
+        float e = rv.cur[i] + ((i & 1u) ? rv.mod * fm_sin_turns(rv.mph[i >> 1]) : 0.0f);
+        float lo = 2.0f + fm_maxf(-rv.xd[i], 0.0f), hi = (float)(rv.cap[i] - 2u) - fm_maxf(rv.xd[i], 0.0f);
+        e = fm_clampf(e, lo, hi);              /* (both reads inside the line) */
+        rv.d[i] = fm_clampf(rv.d[i], lo, hi);
+        rv.dd[i] = (e - rv.d[i]) * inv;
+    }
+    rv.pdd = 0.0f;
+}
+
+/* the soft limit in the lines: itself up to 2, a gentle knee above, 4 at most (a freeze with Feedback) */
+static inline float rv_sat(float v)
+{
+    float a = fm_fabsf(v);
+    if (a <= 2.0f)
+        return v;
+    a = fm_minf(2.0f + (a - 2.0f) * 0.25f, 4.0f);
+    return v < 0.0f ? -a : a;
+}
+
+/* one sample of the network at 22.05 kHz: x in, the wet out in *ol, *or_ */
+static inline void rv_tick(float x, float *ol, float *or_)
+{
+    float r[8], v[8];
+    uint32_t i;
+    /* the low cut, two poles, then the pre-delay (a new type's: crossfaded from the old) */
+    rv.h0 += (x - rv.h0) * rv.lk;
+    x -= rv.h0;
+    rv.h1 += (x - rv.h1) * rv.lk;
+    x -= rv.h1;
+    rv_pre[rv.pw] = x;
+    rv.pre += rv.pdd;
+    {
+        float p = (float)rv.pw - rv.pre, f;
+        int32_t k;
+        if (p < 0.0f)
+            p += (float)RV_PRE_N;
+        k = (int32_t)p;
+        f = p - (float)k;
+        x = rv_pre[(uint32_t)k & (RV_PRE_N - 1u)] * (1.0f - f) + rv_pre[(uint32_t)(k + 1) & (RV_PRE_N - 1u)] * f;
+        if (rv.xf < 1.0f) {
+            float xo;
+            p -= rv.pxd;
+            if (p < 0.0f)
+                p += (float)RV_PRE_N;
+            else if (p >= (float)RV_PRE_N)
+                p -= (float)RV_PRE_N;
+            k = (int32_t)p;
+            f = p - (float)k;
+            xo = rv_pre[(uint32_t)k & (RV_PRE_N - 1u)] * (1.0f - f) + rv_pre[(uint32_t)(k + 1) & (RV_PRE_N - 1u)] * f;
+            x = xo + (x - xo) * rv.xf;
+        }
+    }
+    rv.pw = (rv.pw + 1u) & (RV_PRE_N - 1u);
+    for (i = 0; i < 4u; i++) {           /* the diffusers: all-passes, g = 5/8 */
+        float *b = rv.ap[i], z = b[rv.app[i]], u = x - 0.625f * z;
+        b[rv.app[i]] = u;
+        if (++rv.app[i] >= RV_AP[i])
+            rv.app[i] = 0;
+        x = z + 0.625f * u;
+    }
+    x *= rv.ig;
+    /* the lines' reads: each at its length, a ramp over the block (rv_block) */
+    for (i = 0; i < 8u; i++) {
+        float p, f;
+        uint32_t n = rv.cap[i], k;
+        p = (float)rv.pos[i] - rv.d[i];
+        rv.d[i] += rv.dd[i];
+        if (p < 0.0f)
+            p += (float)n;
+        k = (uint32_t)p;
+        f = p - (float)k;
+        r[i] = rv.line[i][k] * (1.0f - f) + rv.line[i][k + 1u < n ? k + 1u : 0u] * f;
+        if (rv.xf < 1.0f) {                  /* a new type: the old length's read, fading out */
+            float ro;
+            p -= rv.xd[i];
+            if (p < 0.0f)
+                p += (float)n;
+            else if (p >= (float)n)
+                p -= (float)n;
+            k = (uint32_t)p;
+            f = p - (float)k;
+            ro = rv.line[i][k] * (1.0f - f) + rv.line[i][k + 1u < n ? k + 1u : 0u] * f;
+            r[i] = ro + (r[i] - ro) * rv.xf;
+        }
+    }
+    if (rv.xf < 1.0f)
+        rv.xf = fm_minf(rv.xf + RV_XSTEP, 1.0f);
+    {
+        float l = r[0] - r[1] + r[4] - r[5], rr = r[2] - r[3] + r[6] - r[7], m = (l + rr) * 0.5f;
+        float s = (l - rr) * 0.5f * rv.width;
+        *ol = m + s;
+        *or_ = m - s;
+    }
+    for (i = 0; i < 8u; i++) {           /* the damping and the gains (x 1/sqrt 8: the Hadamard's scale) */
+        rv.lp[i] += (r[i] - rv.lp[i]) * rv.dk;
+        rv.lp[i] = fm_flush(rv.lp[i]);
+        v[i] = rv.lp[i] * rv.g[i] * 0.35355339f;
+    }
+    {   /* Hadamard: three stages of butterflies */
+        float a0 = v[0] + v[1], a1 = v[0] - v[1], a2 = v[2] + v[3], a3 = v[2] - v[3];
+        float a4 = v[4] + v[5], a5 = v[4] - v[5], a6 = v[6] + v[7], a7 = v[6] - v[7];
+        float b0 = a0 + a2, b1 = a1 + a3, b2 = a0 - a2, b3 = a1 - a3;
+        float b4 = a4 + a6, b5 = a5 + a7, b6 = a4 - a6, b7 = a5 - a7;
+        v[0] = b0 + b4; v[1] = b1 + b5; v[2] = b2 + b6; v[3] = b3 + b7;
+        v[4] = b0 - b4; v[5] = b1 - b5; v[6] = b2 - b6; v[7] = b3 - b7;
+    }
+    for (i = 0; i < 8u; i++) {           /* the writes */
+        rv.line[i][rv.pos[i]] = rv_sat(v[i] + x);
+        if (++rv.pos[i] >= rv.cap[i])
+            rv.pos[i] = 0;
+    }
+}
+
+static void fx_clear(void)
+{
+    uint32_t k;
+    for (k = 0; k < DLY_N; k++)
+        dly_buf[0][k] = dly_buf[1][k] = 0;
+    dly_dn[0] = dly_dn[1] = (hb_t){{0.0f}, {0.0f}};
+    dly_odd = 0;
+    dly_lp[0] = dly_lp[1] = dly_hp[0] = dly_hp[1] = dly_olp[0] = dly_olp[1] = 0.0f;
+    dly_ph1 = dly_ph2 = 0.0f;            /* the wow from its start: a cleared delay sounds the same each time */
+    self_s = self_e = self_e2 = self_es = 0.0f;
+    drv_m = drv_pi = drv_pw = drv_dc[0] = drv_dc[1] = 0.0f;
+    drv_k = drv_g = 1.0f;
+    dly_kt = dly_t = dly_ms_now() * 0.001f * DR_SR;    /* at its time, no glide from an old one */
+    dly_c = DLY_TYPE[(unsigned)par[P_DLY_TYPE] < DT_NTYPES ? par[P_DLY_TYPE] : DT_TAPE];
+    dly_pt = dly_qt = (uint8_t)((unsigned)par[P_DLY_TYPE] < DT_NTYPES ? par[P_DLY_TYPE] : DT_TAPE);
+    dly_xf = 1.0f;
+    dly_ga = DLY_TYPE[dly_pt].grain;
+    dly_sa = DLY_TYPE[dly_pt].self;
+    rt_snap();
+    rv_clear();
+    fx_gains();
+    fx_quiet = 0;
+}
+
+/* resting (stopped and silent): the delay's time and type go straight to their knobs */
+static void fx_rest(void)
+{
+    dly_kt = dly_t = dly_ms_now() * 0.001f * DR_SR;
+    dly_c = DLY_TYPE[(unsigned)par[P_DLY_TYPE] < DT_NTYPES ? par[P_DLY_TYPE] : DT_TAPE];
+    dly_pt = dly_qt = (uint8_t)((unsigned)par[P_DLY_TYPE] < DT_NTYPES ? par[P_DLY_TYPE] : DT_TAPE);
+    dly_xf = 1.0f;
+    dly_ga = DLY_TYPE[dly_pt].grain;
+    dly_sa = DLY_TYPE[dly_pt].self;
+    rt_snap();
+    fx_gains();
+}
+
+#define RV_WET 0.55f                     /* the wet's level: 0.1's reverb's at the same mix, 1 dB under (its peaks) */
+
+/* the effects, in place on the stereo block l, r (n frames) */
+/* fx_run runs from RAM (drone.c, DR_RAM_CODE): what it does once a block stays in the flash, called through pointers */
+DR_FAR_FN(float, dly_ms_now, (void))
+DR_FAR_FN(void, rv_clear, (void))
+DR_FAR_FN(void, rv_coefs, (float))
+DR_FAR_FN(void, rv_block, (uint32_t, float))
+static DR_RAM_CODE void fx_run(float *l, float *r, uint32_t n)
+{
+    /* the mixes and the repeats as they glide (pfs), and in a straight line across the block from where the
+     * last one ended: read raw (par), each detent was a step, a click on a soft sound */
+    /* stopped or stopping, the repeats can't run away: they ring out (QA 2026-10-20: at 90+ the howl went on after
+     * PLAY, with "PLAY to start" on the screen) */
+    const float ms = DR_FAR(dly_ms_now)(),
+                fbg1 = fade_target <= 0.0f ? fm_minf(rep_g(pfs[P_DLY_REPEATS]), 0.85f) : rep_g(pfs[P_DLY_REPEATS]);
+    const float dm = pfs[P_DLY_MIX] * 0.01f, dry1e = fm_sqrtf(1.0f - dm), wet1e = fm_sqrtf(dm);
+    const float rm = pfs[P_REV_MIX] * 0.01f, dry2e = fm_sqrtf(1.0f - rm), wet2e = fm_sqrtf(rm);
+    const float dn = 1.0f / (float)(n ? n : 1u);
+    float fbg = fx_g[0], dry1 = fx_g[1], wet1 = fx_g[2], dry2 = fx_g[3], wet2 = fx_g[4];
+    const float dfb = (fbg1 - fbg) * dn, dd1 = (dry1e - dry1) * dn, dw1 = (wet1e - wet1) * dn;
+    const float dd2 = (dry2e - dry2) * dn, dw2 = (wet2e - wet2) * dn;
+    const float rstep = 1.0f / (morph_s() * DR_SR);    /* its LFO route switched: crossfade (Morph) */
+    const float damt = depth_amt(par[P_DLY_LFO_DEPTH]) * 0.25f * pfs[P_MOVE] * 0.02f;   /* x the MOVEMENT */
+    const dly_type_t *dt = &DLY_TYPE[(unsigned)par[P_DLY_TYPE] < DT_NTYPES ? par[P_DLY_TYPE] : DT_TAPE];
+    const float ease = fm_minf((float)n * (1.0f / (0.25f * DR_SR)), 1.0f);   /* a type's glide: ~0.25 s */
+    static float sl[BLK], sr[BLK];       /* the reverb's send (mono, in sl) and its wet, a block */
+    static float in_m[BLK], wet_m[BLK];  /* the drones into the delay, and its echoes, mono (the routes' sends) */
+    const int route = (unsigned)par[P_DLY_ROUTE] < DR_NROUTE ? par[P_DLY_ROUTE] : 0;
+    float rw0[DR_NROUTE], drw[DR_NROUTE];
+    float pgain;
+    int mono = 0;
+    uint32_t j;
+    if (!rv.ready)
+        DR_FAR(rv_clear)();
+    if ((uint8_t)par[P_DLY_LFO] != dly_rt) {
+        dly_rp = dly_rt;
+        dly_rt = (uint8_t)par[P_DLY_LFO];
+        dly_rw = 0.0f;
+    }
+    const dly_type_t *pa, *qa;           /* where it reads: the new type, the old (crossfading) */
+    if (dt != &DLY_TYPE[dly_pt]) {
+        if (dly_xf >= 0.5f)              /* mid-crossfade, the louder one is the one it comes from */
+            dly_qt = dly_pt;
+        dly_pt = (uint8_t)(dt - DLY_TYPE);
+        dly_xf = 0.0f;
+    }
+    pa = &DLY_TYPE[dly_pt];
+    qa = &DLY_TYPE[dly_qt];
+    dly_c.tone += (dt->tone - dly_c.tone) * ease;
+    dly_c.out += (dt->out - dly_c.out) * ease;
+    dly_c.ping += (dt->ping - dly_c.ping) * ease;
+    dly_c.gain += (dt->gain - dly_c.gain) * ease;
+    pgain = dly_c.gain;
+    if (pa->spread >= 1.0f && pa->ping <= 0.0f && dly_xf >= 1.0f && dly_c.ping < 0.0005f) {
+        dly_c.ping = 0.0f;               /* settled on a mono type */
+        mono = 1;
+    }
+    DR_FAR(rv_coefs)(ease);
+    dr_dly_ms = dly_t * (1000.0f / DR_SR);
+    /* DELAY */
+    for (j = 0; j < n; j++) {
+        float x, yl, yr, fl, fr, t, wa, wq, pp = dly_c.ping;
+        fbg += dfb;
+        dry1 += dd1;
+        wet1 += dw1;
+        x = (l[j] + r[j]) * 0.5f;
+        in_m[j] = x;
+        {
+            float lfo = lfo_at(dly_rt, j / CR);
+            if (dly_rw < 1.0f) {
+                dly_rw = fm_minf(dly_rw + rstep, 1.0f);
+                lfo = lfo_at(dly_rp, j / CR) + (lfo - lfo_at(dly_rp, j / CR)) * dly_rw;
+            }
+            {   /* the knob's time moves at most half a sample a sample, as a tape motor or a bucket brigade's
+                 * clock: a fast spin of Time had sent the echoes to 3-5x speed for an instant, a bright zip (row 38,
+                 * Evan 2026-11-18); a slow turn never reaches the limit, and the LFO's movement isn't limited */
+                const float k = ms * 0.001f * DR_SR;
+                dly_kt = fade <= 0.0f && fade_target <= 0.0f ? k :   /* stopped: there at once */
+                         k > dly_kt + 0.5f ? dly_kt + 0.5f : k < dly_kt - 0.5f ? dly_kt - 0.5f : k;
+            }
+            t = dly_kt * (1.0f + damt * lfo);
+            dly_t += (t - dly_t) * 0.00045f;                       /* ~50 ms: tape-like */
+        }
+        if (!(j % CR)) {
+            dly_ph1 = advance(dly_ph1, 0.55f * (float)CR / DR_SR);
+            dly_ph2 = advance(dly_ph2, 3.3f * (float)CR / DR_SR);
+        }
+        {
+            float w = 0.75f * fm_sin_turns(dly_ph1) + 0.25f * fm_sin_turns(dly_ph2), m = 0.0f, e = 0.0f;
+            /* GRAIN, SELF: its own echoes move its time. What they follow runs whatever the type (Evan, 2026-10-25:
+             * switched to Self, it lurched for a second, its loudness's mean starting from where it was left) */
+            self_s += (dly_olp[0] - self_s) * 0.04f;
+            self_e += (fm_fabsf(dly_olp[0]) - self_e) * 0.000427f;  /* two stages, ~3 Hz (Evan, 2026-10-26, by ear):
+                                                                     * one at 10 Hz let the level's ripple (twice the
+                                                                     * pitch) through, FM, +2-9 dB; two at 10 Hz still
+                                                                     * warbled +-380 c with high repeats, the echoes'
+                                                                     * beating in their level; at 3 Hz +-77 c */
+            self_e2 += (self_e - self_e2) * 0.000427f;
+            self_es += (self_e2 - self_es) * 0.00003f;
+            if (dly_ga != pa->grain)
+                dly_ga = dly_ga < pa->grain ? fm_minf(dly_ga + pa->grain * DLY_MSTEP, pa->grain)
+                                            : fm_maxf(dly_ga - DLY_TYPE[DT_GRAIN].grain * DLY_MSTEP, pa->grain);
+            if (dly_sa != pa->self)
+                dly_sa = dly_sa < pa->self ? fm_minf(dly_sa + pa->self * DLY_MSTEP, pa->self)
+                                           : fm_maxf(dly_sa - DLY_TYPE[DT_SELF].self * DLY_MSTEP, pa->self);
+            if (dly_ga > 0.0f || dly_sa > 0.0f) {
+                m = self_s;
+                e = self_e2 - self_es;
+            }
+            wa = pa->wow * w + (dly_ga * m + dly_t * dly_sa * e);   /* (summed as before the crossfade: */
+            wq = qa->wow * w + (dly_ga * m + dly_t * dly_sa * e);   /* a steady type reads exactly as it did) */
+        }
+        if (dly_xf < 1.0f)
+            dly_xf = fm_minf(dly_xf + DLY_XSTEP, 1.0f);
+        yl = dly_read(dly_buf[0], fm_clampf(dly_t + wa + pa->wow, 8.0f, DLY_DMAX));
+        if (dly_xf < 1.0f) {
+            float yq = dly_read(dly_buf[0], fm_clampf(dly_t + wq + qa->wow, 8.0f, DLY_DMAX));
+            yl = yq + (yl - yq) * dly_xf;
+        }
+        dly_olp[0] += (yl - dly_olp[0]) * dly_c.out;               /* the wet out */
+        /* the loops: soft clip, the tone, no rumble (~80 Hz taken away) */
+        dly_lp[0] += (sat(yl * fbg) - dly_lp[0]) * dly_c.tone;
+        dly_hp[0] += (dly_lp[0] - dly_hp[0]) * 0.0114f;
+        fl = dly_lp[0] - dly_hp[0];
+        if (mono) {                      /* Tape, Clean (settled): the right is the left, worked out once */
+            yr = yl;
+            dly_olp[1] = dly_olp[0];
+            dly_lp[1] = dly_lp[0];
+            dly_hp[1] = dly_hp[0];
+            fr = fl;
+        } else {
+            yr = dly_read(dly_buf[1], fm_clampf(dly_t * pa->spread + wa + pa->wow, 8.0f, DLY_DMAX));
+            if (dly_xf < 1.0f) {
+                float yq = dly_read(dly_buf[1], fm_clampf(dly_t * qa->spread + wq + qa->wow, 8.0f, DLY_DMAX));
+                yr = yq + (yr - yq) * dly_xf;
+            }
+            dly_olp[1] += (yr - dly_olp[1]) * dly_c.out;
+            dly_lp[1] += (sat(yr * fbg) - dly_lp[1]) * dly_c.tone;
+            dly_hp[1] += (dly_lp[1] - dly_hp[1]) * 0.0114f;
+            fr = dly_lp[1] - dly_hp[1];
+        }
+        {   /* stereo: each side feeds itself; ping-pong: the input into L, L into R, R into L */
+            float wl = x + fl * (1.0f - pp) + fr * pp, wr = x * (1.0f - pp) + fr * (1.0f - pp) + fl * pp;
+            if (!dly_odd) {              /* the first of a pair: in hand */
+                dly_in[0] = wl;
+                dly_in[1] = wr;
+                dly_odd = 1;
+            } else {                     /* the second: the pair down to one sample a side, written */
+                float a = (hb_ap(&dly_dn[0], 1, HB_A1, hb_ap(&dly_dn[0], 0, HB_A0, wl)) +
+                           hb_ap(&dly_dn[0], 3, HB_A3, hb_ap(&dly_dn[0], 2, HB_A2, dly_in[0]))) * 0.5f;
+                float b = (hb_ap(&dly_dn[1], 1, HB_A1, hb_ap(&dly_dn[1], 0, HB_A0, wr)) +
+                           hb_ap(&dly_dn[1], 3, HB_A3, hb_ap(&dly_dn[1], 2, HB_A2, dly_in[1]))) * 0.5f;
+                dly_buf[0][dly_w] = (int16_t)(fm_clampf(a, -1.99f, 1.99f) * 16384.0f);
+                dly_buf[1][dly_w] = (int16_t)(fm_clampf(b, -1.99f, 1.99f) * 16384.0f);
+                dly_w = dly_w + 1u >= DLY_N ? 0u : dly_w + 1u;
+                dly_odd = 0;
+            }
+        }
+        wet_m[j] = (dly_olp[0] + dly_olp[1]) * 0.5f * wet1 * pgain;
+        l[j] = l[j] * dry1 + dly_olp[0] * wet1 * pgain;
+        r[j] = r[j] * dry1 + dly_olp[1] * wet1 * pgain;
+    }
+    drive_run(l, r, n);                  /* DRIVE: the drones and their repeats together */
+    {
+        int q;
+        for (q = 0; q < DR_NROUTE; q++) {          /* toward the route, 50 ms the whole way, sample by sample */
+            float to = q == route ? 1.0f : 0.0f;
+            rw0[q] = rt_w[q];
+            rt_w[q] = to > rt_w[q] ? fm_minf(rt_w[q] + (float)n * DLY_XSTEP, to) : fm_maxf(rt_w[q] - (float)n * DLY_XSTEP, to);
+            drw[q] = (rt_w[q] - rw0[q]) * dn;
+        }
+    }
+    {
+        float w0 = rw0[0], w1 = rw0[1], w2 = rw0[2];
+        for (j = 0; j < n; j++) {             /* the reverb's send */
+            w0 += drw[0];
+            w1 += drw[1];
+            w2 += drw[2];
+            sl[j] = (l[j] + r[j]) * 0.5f * w0 + wet_m[j] * w1 + in_m[j] * w2;
+        }
+    }
+    /* REVERB at the half rate: the send down, the network, the wet up */
+    DR_FAR(rv_block)(n / 2u, (float)n / DR_SR);
+    {   /* Shimmer washes in over 8 s and out over 6; none and not the type: the shift isn't run */
+        const float was = sh.amt;
+        sh.amt = par[P_REV_TYPE] == RV_SHIMMER ? fm_minf(sh.amt + (float)n * (1.0f / (SH_IN_S * DR_SR)), 1.0f)
+                                               : fm_maxf(sh.amt - (float)n * (1.0f / (SH_OUT_S * DR_SR)), 0.0f);
+        if (was > 0.0f && sh.amt <= 0.0f) {      /* out: its line emptied, so a later Shimmer starts clean, not
+                                                  * with the last one's audio */
+            uint32_t q;
+            for (q = 0; q < SH_N; q++)
+                sh_buf[q] = 0.0f;
+            sh.lp1 = sh.lp2 = 0.0f;
+        }
+    }
+    for (j = 0; j + 1u < n; j += 2u) {
+        float a = sl[j], b = sl[j + 1u], x, ol, or_;
+        x = (hb_ap(&rv.dn, 1, HB_A1, hb_ap(&rv.dn, 0, HB_A0, b)) + hb_ap(&rv.dn, 3, HB_A3, hb_ap(&rv.dn, 2, HB_A2, a))) * 0.5f;
+        if (sh.amt > 0.0f)
+            x = x * (1.0f - SH_DRY * sh.amt) + SH_GAIN * sh.amt * sh_tick(x);
+        rv_tick(x, &ol, &or_);
+        sl[j] = hb_ap(&rv.up[0], 1, HB_A1, hb_ap(&rv.up[0], 0, HB_A0, ol));
+        sl[j + 1u] = hb_ap(&rv.up[0], 3, HB_A3, hb_ap(&rv.up[0], 2, HB_A2, ol));
+        sr[j] = hb_ap(&rv.up[1], 1, HB_A1, hb_ap(&rv.up[1], 0, HB_A0, or_));
+        sr[j + 1u] = hb_ap(&rv.up[1], 3, HB_A3, hb_ap(&rv.up[1], 2, HB_A2, or_));
+    }
+    if (n & 1u) {                        /* (never at the block sizes in use: the wet held a sample) */
+        sl[n - 1u] = rv.hold[0];
+        sr[n - 1u] = rv.hold[1];
+    }
+    if (n >= 2u) {
+        rv.hold[0] = sl[n - 1u];
+        rv.hold[1] = sr[n - 1u];
+    }
+    {
+        float w1 = rw0[1];
+        for (j = 0; j < n; j++) {             /* the echoes alone in: the dry kept whole, the wash added */
+            float d;
+            dry2 += dd2;
+            wet2 += dw2;
+            w1 += drw[1];
+            d = dry2 + (1.0f - dry2) * w1;
+            l[j] = l[j] * d + sl[j] * RV_WET * rv.gain * wet2;
+            r[j] = r[j] * d + sr[j] * RV_WET * rv.gain * wet2;
+        }
+    }
+    fx_g[0] = fbg1;
+    fx_g[1] = dry1e;
+    fx_g[2] = wet1e;
+    fx_g[3] = dry2e;
+    fx_g[4] = wet2e;
+}
