@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+"""The manual's pages for the site, from the Markdown in docs/manual (decided 2026-11-11: the manual as pages of
+the site, written as Markdown in the repo so it reads on GitHub too).
+
+  tools/make_manual.py OUT_DIR            the pages into OUT_DIR/manual/ (the emulator's build, the release's site)
+  tools/make_manual.py --check            every page read, every link, anchor, picture and recipe checked
+  tools/make_manual.py --renders [NAME]   the recipes' screens (docs/manual/media, committed) and sounds
+                                          (build/manual-audio, not committed), from docs/manual/renders/*.omni
+
+The Markdown is plain (headings, paragraphs, lists, tables, quotes, links, pictures, `code`, **bold**, *italic*),
+with three additions that read well on GitHub too:
+  ---\\ntitle: ...\\nintro: ...\\n---     a page's banner (the intro shows without its closing period)
+  [[G#3]] [[EDIT]]                      a key or button, in a box
+  {#id} {.coming} after a ### heading   a recipe's link name; a recipe not written yet
+On a recipe page (docs/manual/recipes/*.md): a ## heading is a group of recipes; each ### heading is a recipe whose
+first paragraph, in *italics*, is its line in the list at the top; then what you hear, the moves (1. 2. 3.), a quote
+for Good to know, its pictures, and **Listen** (`NAME`) with its times (- 0:03 what to listen for)."""
+import functools
+import hashlib
+import html
+import math
+import re
+import shutil
+import subprocess
+import sys
+import wave
+from array import array
+from pathlib import Path
+
+SRC = Path(__file__).resolve().parents[1]
+MAN = SRC / "docs" / "manual"
+WEB = SRC / "web" / "manual"                       # the pages' style and the banner's bands
+AUDIO = SRC / "build" / "manual-audio"
+REPO = "https://github.com/evanyerburgh/niagara-drift"
+LEVEL_LUFS = -14.0                                 # every recipe's sound at this perceived loudness (BS.1770), peaks under -1 dBFS
+
+GH = ('<svg class="gh" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .297c-6.63 0-12 5.373-12 '
+      '12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.'
+      '422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.30'
+      '5 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.52'
+      '3.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.2'
+      '3.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-'
+      '.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>')
+HOME = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.2 12 3.5l9 7.7" fill="none" stroke="currentColor" '
+        'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5.6 9.6V20h4.6v-5.6h3.6V20h4.6V9.6" '
+        'fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>')
+# the menu, the same on every page: what each holds, for the menu's second line
+def icon(name, cls="ic"):
+    """A Phosphor icon (light, MIT, web/manual/icons) as inline SVG in the text's color, hidden from screen readers."""
+    s = (WEB / "icons" / f"{name}.svg").read_text(encoding="utf-8").strip()
+    return s.replace("<svg ", f'<svg class="{cls}" aria-hidden="true" focusable="false" ', 1)
+
+
+MENU_ICON = {"Play it": "play", "Recipes": "cooking-pot", "Reference": "book-open",
+             "Shortcuts": "keyboard", "Help": "lifebuoy", "About": "info"}
+TAB_ICON = {"sounds": "waveform", "gestures": "hand-pointing", "scenes": "floppy-disk", "time": "timer",
+            "performing": "faders", "scratch": "plant"}
+JA = MAN / "ja"                                    # the Japanese pages (Help 2026-11-17, the rest 2026-11-18)
+MENU = [("", "Play it", "the emulator, and the first steps under it"),
+        ("manual/recipes/sounds/", "Recipes", "how to get a sound or a move"),
+        ("manual/reference/", "Reference", "every page, knob and key"),
+        ("manual/reference/shortcuts/", "Shortcuts", "every combination, hold and tap"),
+        ("manual/help/", "Help", "installing, going back, feedback"),
+        ("manual/about/", "About", "what it does, the details, where it came from")]
+# Japanese: a page not translated goes to the English one, marked 英語 (ja_href; docs/translations/ja-glossary.md)
+MENU_JA = [("ja/", "Play it", "弾いてみる", "エミュレーターと、その下の最初の一歩"),
+           ("manual/recipes/sounds/", "Recipes", "レシピ", "音や動きの作り方"),
+           ("manual/reference/", "Reference", "リファレンス", "すべてのページ、ノブ、キー"),
+           ("manual/reference/shortcuts/", "Shortcuts", "ショートカット", "キーの組み合わせ、長押しとタップ"),
+           ("ja/manual/help/", "Help", "ヘルプ", "インストール、元に戻す、フィードバック"),
+           ("manual/about/", "About", "概要", "できること、詳細、成り立ち")]
+
+
+def ja_href(h):
+    """An English manual page's address (manual/X/), as the Japanese page's where there is one (ja/manual/X/)."""
+    if not h.startswith("manual/"):
+        return h
+    rel = h[len("manual/"):].strip("/")
+    return "ja/" + h if (JA / ((rel or "index") + ".md")).exists() or (JA / rel / "index.md").exists() else h
+# the words the page code writes itself, per language (Japanese: docs/translations/ja-glossary.md)
+WORDS = {"en": {"good": "Good to know", "listen": "Listen", "play_from": "Play {t} from {m}:{s}", "example": "{t}: a sound example",
+                "all_recipes": "All {n} recipes on this page", "coming": "(coming)", "recipes_of": "{l}: the recipes",
+                "kinds": "Recipe kinds", "all_ref": "All reference pages", "ref": "Reference", "the_ref": "The reference",
+                "recipes": "Recipes"},
+         "ja": {"good": "補足", "listen": "聴いてみる", "play_from": "{t}を{m}:{s}から再生", "example": "{t}：音の例",
+                "all_recipes": "このページのレシピ（{n}）", "coming": "（準備中）", "recipes_of": "{l}：レシピ",
+                "kinds": "レシピの種類", "all_ref": "リファレンスのページ", "ref": "リファレンス", "the_ref": "リファレンス",
+                "recipes": "レシピ"}}
+# a quiet line in the Japanese pages' small print (Evan, 2026-11-18: the boxed note at the top was "too prominent and too
+# strong"); {up}: the site's root from the page
+JA_NOTE = ('このマニュアルはAIで翻訳しました。より自然な表現があれば、'
+           '<a href="{up}ja/manual/help/#send-feedback">お知らせください</a>。')
+
+
+def lang_item(href, lang, name, small):
+    """The other language as the menu's last item: shown only on phones (≤480 px), where the row has no room for its
+    pill (manual.css, web/emu/index.html)."""
+    return (f'<a class="langitem" href="{href}" hreflang="{lang}">{icon("arrows-left-right", "mi")}'
+            f'<span><span lang="{lang}">{name}</span><small>{small}</small></span></a>')
+
+
+def menu_html(up, current, lang="en", other="ja/"):
+    """Install, Source, the other language (other: its page, from the site's root) and the menu (the front page has
+    the same, web/emu/index.html)."""
+    if lang == "ja":
+        items = "".join(f'<a href="{up}{ja_href(h)}"{" aria-current=\"page\"" if n == current else ""}>{icon(MENU_ICON[n], "mi")}'
+                        f'<span>{j}{"" if ja_href(h) != h or h.startswith("ja/") else "（英語）"}<small>{s}</small></span></a>'
+                        for h, n, j, s in MENU_JA)
+        return (f'<a href="{up}ja/install/">インストール</a><a href="{up}ja/manual/help/#send-feedback">フィードバック</a>'
+                f'<a href="{REPO}" aria-label="GitHubのソース">ソース{GH}</a>'
+                f'<a class="lang" href="{up}{other}" lang="en" hreflang="en">English</a>'
+                f'<details class="menubtn"><summary aria-label="メニュー" title="メニュー">メニュー</summary><div class="panel">{items}'
+                f'{lang_item(up + other, "en", "English", "英語のページへ")}</div></details>')
+    items = "".join(f'<a href="{up}{h}"{" aria-current=\"page\"" if n == current else ""}>{icon(MENU_ICON[n], "mi")}'
+                    f'<span>{n}<small>{s}</small></span></a>'
+                    for h, n, s in MENU)
+    return (f'<a href="{up}install/">Install</a><a href="{up}manual/help/#send-feedback">Feedback</a><a href="{REPO}" aria-label="Source on GitHub">Source{GH}</a>'
+            f'<a class="lang" href="{up}{other}" lang="ja" hreflang="ja">日本語</a>'
+            f'<details class="menubtn"><summary aria-label="Menu" title="Menu">Menu</summary><div class="panel">{items}'
+            f'{lang_item(up + other, "ja", "日本語", "in Japanese")}</div></details>')
+
+
+# ---- Markdown ----------------------------------------------------------------------------------------------------
+
+def inline(s):
+    """A line's words: `code`, pictures, links, [[keys]], **bold**, *italic*; the rest escaped."""
+    keep = []
+
+    def stash(h):
+        keep.append(h)
+        return f"\x00{len(keep) - 1}\x00"
+    s = re.sub(r"`([^`]+)`", lambda m: stash(f"<code>{html.escape(m.group(1))}</code>"), s)
+    s = re.sub(r"<a id=\"([\w-]+)\"></a>", lambda m: stash(f'<a id="{m.group(1)}"></a>'), s)
+    s = html.escape(s, quote=False)
+    s = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)(?: "([^"]*)")?\)',
+               lambda m: stash(f'<img src="{m.group(2)}" alt="{html.escape(m.group(1))}">'), s)
+    s = re.sub(r"\[\[([^\]]+)\]\]", lambda m: stash(f'<span class="k">{m.group(1)}</span>'), s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", lambda m: stash(f'<a href="{m.group(2)}">{m.group(1)}</a>'), s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", s)
+    while "\x00" in s:
+        s = re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], s)
+    return s
+
+
+CJK = re.compile(r"[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef]")
+
+
+def join(a, b):
+    """Two lines of one paragraph: a space between English words, none inside a Japanese sentence (a line that starts
+    with Japanese, or Japanese then punctuation), which a browser would show as a gap."""
+    if a and b and (CJK.match(b[0]) or (CJK.match(a[-1]) and (not b[0].isascii() or a[-1] in "。、：）」"))):
+        return a + b
+    return a + " " + b if a else b
+
+
+def blocks(text):
+    """The Markdown's blocks: (kind, data) in order."""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        ln = lines[i]
+        if not ln.strip():
+            i += 1
+            continue
+        m = re.match(r"(#{1,4})\s+(.*)", ln)
+        if m:
+            out.append(("h", (len(m.group(1)), m.group(2).strip())))
+            i += 1
+            continue
+        if ln.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                rows.append(lines[i])
+                i += 1
+            out.append(("table", rows))
+            continue
+        if ln.startswith(">"):
+            q = []
+            while i < len(lines) and lines[i].startswith(">"):
+                q.append(lines[i][1:].lstrip())
+                i += 1
+            out.append(("quote", "\n".join(q)))
+            continue
+        if re.match(r"(\d+\.|-)\s", ln):
+            items, ordered = [], ln[0].isdigit()
+            while i < len(lines) and lines[i].strip() and not re.match(r"#{1,4}\s|\||>", lines[i]):
+                l2 = lines[i]
+                if re.match(r"(\d+\.|-)\s", l2):
+                    items.append([0, re.sub(r"^(\d+\.|-)\s+", "", l2)])
+                elif re.match(r"  +(\d+\.|-)\s", l2):
+                    items.append([1, re.sub(r"^\s+(\d+\.|-)\s+", "", l2)])
+                else:
+                    items[-1][1] = join(items[-1][1], l2.strip())
+                i += 1
+            out.append(("ol" if ordered else "ul", items))
+            continue
+        if ln.lstrip().startswith("<"):
+            h = []
+            while i < len(lines) and lines[i].strip():
+                h.append(lines[i])
+                i += 1
+            out.append(("html", "\n".join(h)))
+            continue
+        p = []
+        while i < len(lines) and lines[i].strip() and not re.match(r"#{1,4}\s|\||>|(\d+\.|-)\s", lines[i]):
+            p.append(lines[i].strip())
+            i += 1
+        out.append(("p", functools.reduce(join, p, "")))
+    return out
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", re.sub(r"<[^>]+>|\*|`|\[\[|\]\]", "", s).lower()).strip("-")
+
+
+def list_html(kind, items):
+    """A list, with a second level under an item (two spaces in)."""
+    out, open2 = f"<{kind}>", False
+    for n, (lvl, txt) in enumerate(items):
+        if lvl == 0:
+            if open2:
+                out += "</ul>"
+                open2 = False
+            if n:
+                out += "</li>"
+            out += f"<li>{inline(txt)}"
+        else:
+            if not open2:
+                out += "<ul>"
+                open2 = True
+            out += f"<li>{inline(txt)}</li>"
+    return out + ("</ul>" if open2 else "") + f"</li></{kind}>"
+
+
+def table_html(rows):
+    cells = [[c.strip() for c in r.strip().strip("|").split("|")] for r in rows]
+    head, body = cells[0], [r for r in cells[1:] if not all(re.fullmatch(r":?-+:?", c) for c in r)]
+    th = "".join(f"<th>{inline(c)}</th>" for c in head)
+    tb = "".join("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in r) + "</tr>" for r in body)
+    head_html = f"<thead><tr>{th}</tr></thead>" if any(head) else ""     # a blank header row (| | |) left out
+    return f'<div class="tablewrap"><table>{head_html}<tbody>{tb}</tbody></table></div>'
+
+
+def render(bl, h_shift=0):
+    """Blocks to HTML (a heading's level as written, its id from its words or {#id})."""
+    out = []
+    for kind, d in bl:
+        if kind == "h":
+            lvl, t = d
+            m = re.search(r"\s*\{#([\w-]+)\}\s*$", t)
+            hid = m.group(1) if m else slug(t)
+            t = re.sub(r"\s*\{[^}]*\}\s*$", "", t)
+            out.append(f'<h{lvl + h_shift} id="{hid}">{inline(t)}</h{lvl + h_shift}>')
+        elif kind == "p":
+            out.append(f"<p>{inline(d)}</p>")
+        elif kind in ("ul", "ol"):
+            out.append(list_html(kind, d))
+        elif kind == "table":
+            out.append(table_html(d))
+        elif kind == "quote":
+            out.append(f'<div class="note">{render(blocks(d))}</div>')
+        elif kind == "html":
+            out.append(d)
+    return "\n".join(out)
+
+
+def front(text):
+    """A page's banner (its title and intro) from the lines between --- and ---."""
+    meta = {}
+    m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if m:
+        for ln in m.group(1).split("\n"):
+            k, _, v = ln.partition(":")
+            meta[k.strip()] = v.strip()
+        text = text[m.end():]
+    return meta, text
+
+
+# ---- recipes -----------------------------------------------------------------------------------------------------
+
+def recipe_page(text, lang="en"):
+    """A recipe page: (groups of (id, title, line, written)), the recipes' HTML). A page without groups gives its
+    recipes h2, so no heading level is skipped after the banner's h1."""
+    bl = blocks(text)
+    hl = 3 if any(k == "h" and d[0] == 2 for k, d in bl) else 2
+    groups, recipes, i = [], [], 0
+    while i < len(bl):
+        kind, d = bl[i]
+        if kind == "h" and d[0] == 2:                 # a group: its heading and what's under it (a line, a picture)
+            m = re.search(r"\s*\{#([\w-]+)\}\s*$", d[1])
+            gt = d[1][:m.start()] if m else d[1]
+            groups.append((gt, []))                   # above its recipes, as in the list at the top
+            j = i + 1
+            while j < len(bl) and not (bl[j][0] == "h" and bl[j][1][0] <= 3):
+                j += 1
+            recipes.append(f'<h2 class="group-head" id="{m.group(1) if m else slug(gt)}">{inline(gt)}</h2>' + render(bl[i + 1:j]))
+            i = j
+            continue
+        if kind == "h" and d[0] == 3:
+            t = d[1]
+            rid = re.search(r"\{#([\w-]+)", t).group(1)
+            coming = ".coming" in t
+            title = re.sub(r"\s*\{[^}]*\}\s*$", "", t)
+            j = i + 1
+            body = []
+            while j < len(bl) and not (bl[j][0] == "h" and bl[j][1][0] <= 3):
+                body.append(bl[j])
+                j += 1
+            line = re.sub(r"^\*(.*)\*$", r"\1", body[0][1]) if body and body[0][0] == "p" else ""
+            if not groups:
+                groups.append(("", []))
+            groups[-1][1].append((rid, title, line, not coming))
+            if not coming:
+                recipes.append(recipe_html(rid, title, body[1:], hl, lang))
+            i = j
+            continue
+        i += 1
+    return groups, recipes
+
+
+def recipe_html(rid, title, body, hl=3, lang="en"):
+    W = WORDS[lang]
+    lead, moves, good, pics, listen, nmoves = "", "", "", [], None, 0
+    k = 0
+    while k < len(body):
+        kind, d = body[k]
+        if kind == "p" and d.startswith(("**Listen**", "**聴いてみる**")):
+            name = re.search(r"`([\w-]+)`", d).group(1)
+            rows = body[k + 1][1] if k + 1 < len(body) and body[k + 1][0] == "ul" else []
+            listen = (name, [re.match(r"(\d+):(\d\d)\s+(.*)", r[1]).groups() for r in rows])
+            k += 2
+            continue
+        if kind == "p" and d.startswith("!["):
+            pics += re.findall(r'!\[([^\]]*)\]\(([^)\s]+) "([^"]*)"\)', d)
+        elif kind == "p" and not lead:
+            lead = inline(d)
+        elif kind == "ol":                             # the steps; a long walk-through in stages (#### heads), numbered
+            moves += (f'<ol class="moves" style="counter-reset: m {nmoves}">'     # straight through
+                      + "".join(f"<li>{inline(t)}</li>" for _, t in d) + "</ol>")
+            nmoves += len(d)
+        elif kind == "h" and d[0] == 4:
+            moves += f'<h{hl + 1} class="stage">{inline(d[1])}</h{hl + 1}>'
+        elif kind == "quote":                          # a box: "Good to know", or its own bold label ("Where next.")
+            m = re.match(r"^\*\*([^*]+?)[.。]?\*\*\s*", d)
+            label = m.group(1) if m and m.group(1) not in ("Good to know", "補足") else W["good"]
+            good += f"<div class=good><b>{inline(label)}</b>{render(blocks(d[m.end():] if m else d))}</div>"
+        k += 1
+    figs = "".join(f'<figure><img src="../../media/{Path(s).name}" alt="{html.escape(a)}"><figcaption>{inline(c)}</figcaption></figure>'
+                   for a, s, c in pics)
+    snd = ""
+    if listen:
+        name, rows = listen
+        t = html.escape(title)
+        li = "".join(f'<li><button data-t="{int(mm) * 60 + int(ss)}" aria-label="{W["play_from"].format(t=t, m=mm, s=ss)}">'
+                     f'{mm}:{ss}</button><span>{inline(w)}</span></li>' for mm, ss, w in rows)
+        snd = (f'<div class="listen"><h{hl + 1} id="{rid}-listen">{W["listen"]}</h{hl + 1}><audio controls preload="metadata" '
+               f'src="../../media/{name}.mp4" aria-label="{W["example"].format(t=t)}"></audio><ol>{li}</ol></div>')
+    return (f'<section class="recipe" id="{rid}"><div class="recipe-head"><h{hl}>{inline(title)}</h{hl}>'
+            f'</div>'
+            f'<div class="recipe-body"><div class="how">{f"<p class=lead>{lead}</p>" if lead else ""}{moves}'
+            f'{good}</div>'
+            + (f'<div class="screens">{figs}</div>' if figs else "") + f'{snd}</div></section>')
+
+
+def onpage(groups, base, label, lang="en"):
+    """The page's recipes as a compact list at its top (Evan, 2026-11-13: the cards pushed the first recipe a screen and
+    a half down): a line a group, its name then the recipes' names, each a link; one not written yet in gray."""
+    out = ""
+    for g, items in groups:
+        names = " ".join(
+            (f'<a href="{base}#{i}" title="{html.escape(re.sub(r"<[^>]+>", "", inline(s)))}">{inline(t)}</a>' if done else
+             f'<span class="soon">{inline(t)} {WORDS[lang]["coming"]}</span>')
+            for i, t, s, done in items)
+        out += f'<li>{f"<b>{inline(g)}</b>" if g else ""}<span class="names">{names}</span></li>'
+    # folded on a phone, where the list was a screen before the first recipe (the 2026-11-13 review), as the reference's
+    n = sum(1 for _, items in groups for *_, done in items if done)
+    W = WORDS[lang]
+    return (f'<nav class="onpage-nav" aria-label="{W["recipes_of"].format(l=label)}"><details><summary>{W["all_recipes"].format(n=n)}</summary>'
+            f'<ul class="onpage">{out}</ul></details></nav>'
+            '<script>if (matchMedia("(min-width: 821px)").matches) document.querySelector(".onpage-nav details").open = true;</script>')
+
+
+# ---- pages -------------------------------------------------------------------------------------------------------
+
+RECIPE_KINDS = ["sounds", "gestures", "scenes", "time", "performing", "scratch"]   # scratch: the tutorial, one walk-through
+
+
+def banner_html(up, title, intro, kicker="", current="", lang="en", other="ja/"):
+    """The red banner with the menu, a page's kicker, title and intro (the install page has it too: make_pages.py)."""
+    home = (f'<a class="homeicon" href="{up}ja/" aria-label="ホーム：Niagara Driftをブラウザーで弾く" title="ホーム">{HOME}</a>'
+            if lang == "ja" else
+            f'<a class="homeicon" href="{up}" aria-label="Home: Niagara Drift, play it in your browser" title="Home">{HOME}</a>')
+    return f"""<div class="top"><div class="top-in">
+<nav class="menu" aria-label="Site">{home}{menu_html(up, current, lang, other)}</nav>
+<div class="title"><small>{"Niagara Drift" + (" · " + kicker if kicker else "")}</small><h1>{inline(title)}</h1><p>{inline(intro)}</p></div>
+</div></div>"""
+
+
+def page_html(rel, meta, body, current, side="", lang="en"):
+    depth = 1 + (rel.count("/") + 1 if rel else 0)    # folders under the site's root
+    if lang == "ja":
+        depth += 1                                     # ja/manual/...
+    up, mup = "../" * depth, "../" * (depth - 1)
+    if lang == "ja":
+        mup = up + "manual/"                           # one style and script for both languages
+    other = (("manual/" + rel + "/" if rel else "manual/") if lang == "ja" else
+             ("ja/manual/" + rel + "/" if (JA / ((rel or "index") + ".md")).exists() else "ja/"))
+    title, intro = meta.get("title", ""), meta.get("intro", "").rstrip(".。")
+    kicker = meta.get("kicker", "")
+    desc = html.escape(meta.get("description", meta.get("intro", "")))
+    img = f'<meta property="og:image" content="{up}manual/media/{meta["image"]}">' if meta.get("image") else ""
+    return f"""<!doctype html>
+<html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)} · Niagara Drift</title>{alt_links(rel, lang, up)}
+<meta name="description" content="{desc}"><meta property="og:title" content="{html.escape(title)} · Niagara Drift">
+<meta property="og:description" content="{desc}">{img}<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="{mup}manual.css"></head>
+<body>
+<a class="skip" href="#main">{"本文へ移動" if lang == "ja" else "Skip to content"}</a>
+{banner_html(up, title, intro, kicker, current, lang, other)}
+<main id="main" tabindex="-1" class="page{' side' if side else ''}">{side}<div class="prose">{body}</div></main>
+{FOOT_JA.format(note=JA_NOTE.format(up=up), about=up + ja_href("manual/about/"), repo=REPO) if lang == "ja" else FOOT_EN.format(mup=mup, repo=REPO)}
+<script src="{mup}manual.js"></script>
+</body></html>"""
+
+
+FOOT_EN = '<p class="foot">Niagara Drift · free, open-source firmware (GPL-3.0) for the M-VAVE FM-1. Sound examples are rendered from the\nfirmware\'s own code on a computer, with headphones\' settings, not recorded from an FM-1. <a href="{mup}about/">About</a> ·\n<a href="{repo}">Source on GitHub</a></p>'
+FOOT_JA = ('<p class="foot">Niagara Drift · M-VAVE FM-1用の無料・オープンソースのファームウェア（GPL-3.0）。音の例は'
+           'ファームウェア自身のコードからパソコン上で作ったもので（ヘッドホンの設定）、FM-1から録音したものではありません。'
+           '{note} <a href="{about}">概要</a> · <a href="{repo}">GitHubのソース</a></p>\n')
+
+
+def alt_links(rel, lang, up):
+    """The page in the other language, for search engines (hreflang): only where both exist."""
+    if not (JA / ((rel or "index") + ".md")).exists():
+        return ""
+    en, ja = up + ("manual/" + rel + "/" if rel else "manual/"), up + ("ja/manual/" + rel + "/" if rel else "ja/manual/")
+    return f'<link rel="alternate" hreflang="en" href="{en}"><link rel="alternate" hreflang="ja" href="{ja}">'
+
+
+def build(out):
+    """Every page into out/manual/."""
+    dst = out / "manual"
+    if dst.exists():
+        shutil.rmtree(dst)
+    (dst / "media").mkdir(parents=True)
+    for f in ("manual.css", "manual.js"):
+        shutil.copy(WEB / f, dst / f)
+    for f in (MAN / "media").glob("*.png"):
+        shutil.copy(f, dst / "media" / f.name)
+    for f in (SRC / "docs" / "img").glob("*.png"):
+        shutil.copy(f, dst / "media" / f.name)
+    for f in AUDIO.glob("*.mp4") if AUDIO.exists() else []:
+        shutil.copy(f, dst / "media" / f.name)
+    pages = pages_of(MAN, dst, "en")
+    pages += build_ja(out)
+    for p in list(dst.rglob("index.html")) + list((out / "ja" / "manual").rglob("index.html")):   # each sound and picture tagged with its contents: a browser
+        t = p.read_text(encoding="utf-8")                # that kept an earlier one fetches the new one (Safari did)
+        def tag(m):
+            f = dst / "media" / m.group(2)
+            return m.group(0) if not f.exists() else f'{m.group(1)}{m.group(2)}?v={hashlib.sha1(f.read_bytes()).hexdigest()[:8]}"'
+        p.write_text(re.sub(r'(src="[^"]*media/)([\w.-]+\.(?:mp4|png))"', tag, t), encoding="utf-8")
+    missing = sorted({m for p in dst.rglob("index.html") for m in re.findall(r'src="[^"]*media/([\w-]+\.mp4)(?:\?v=\w+)?"', p.read_text())}
+                     - {f.name for f in (dst / "media").glob("*.mp4")})
+    print(f"manual: {dst}: {pages} pages" + (f"; no sound yet for {len(missing)} recipes (tools/make_manual.py --renders)"
+                                               if missing else ""))
+
+
+def build_ja(out):
+    """The Japanese pages (docs/manual/ja) into out/ja/manual/, made as the English ones; a link to a page not
+    translated goes to the English one."""
+    dst = out / "ja" / "manual"
+    if dst.exists():
+        shutil.rmtree(dst)
+    return pages_of(JA, dst, "ja") if JA.exists() else 0
+
+
+def pages_of(root, dst, lang):
+    """Every page of one language (root: docs/manual or docs/manual/ja) into dst; how many."""
+    W, pages = WORDS[lang], 0
+    for md in sorted(root.rglob("*.md")):
+        if md.relative_to(root).as_posix().startswith(("renders/", "ja/")):
+            continue
+        rel = page_rel(md, root)
+        meta, text = front(md.read_text(encoding="utf-8"))
+        text = re.sub(r"<!-- github -->.*?<!-- /github -->\n?", "", text, flags=re.S)   # for the GitHub copy only
+        kind = rel.split("/")[0] if rel else ""
+        if kind == "reference":                        # "## Drones and Pitch" under the banner's "Drones and Pitch":
+            text = re.sub(r"\A((?:\s*<!--.*?-->)?\s*)## " + re.escape(meta.get("title", "")) + r"(?:\s*\{#[\w-]+\})?\n", r"\1",
+                          text, flags=re.S)
+        current = {"recipes": "Recipes", "help": "Help", "about": "About"}.get(kind, "Reference" if kind == "reference" else "")
+        if rel == "reference/shortcuts":
+            current = "Shortcuts"
+        side = ""
+        if rel.startswith("recipes/") and rel.split("/")[1] in RECIPE_KINDS:
+            groups, recipes = recipe_page(text, lang)
+            first = text.split("\n## ", 1)[0].split("\n### ", 1)[0]     # the words before the first group or recipe
+            only = [r for r in recipes if not r.startswith('<h2 class="group-head"')]
+            tb = tabs(rel.split("/")[1], root=root, lang=lang)
+            if len(only) == 1:                         # one walk-through (the tutorial): the page's title is its heading
+                one = re.sub(r'<div class="recipe-head">.*?</div>', "", only[0], flags=re.S)
+                one = re.sub(r'<h3 class="stage">(.*?)</h3>', r'<h2 class="stage">\1</h2>', one)
+                body = tb + render(blocks(first)) + one
+            else:
+                body = (tb + render(blocks(first)) + onpage(groups, "", meta.get("title", ""), lang) + "".join(recipes))
+            meta.setdefault("kicker", W["recipes"])
+        elif rel == "recipes":                         # no landing page (Evan, 2026-11-13): the tabs are on every recipe
+            p = dst / rel / "index.html"               # page, so Recipes opens on Sounds; this address forwards there
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f'<!doctype html><html lang="{lang}"><meta charset="utf-8"><title>{W["recipes"]} · Niagara Drift</title>'
+                         '<link rel="canonical" href="sounds/"><meta http-equiv="refresh" content="0; url=sounds/">'
+                         f'<p><a href="sounds/">{W["recipes"]}: Sounds</a></p></html>', encoding="utf-8")
+            pages += 1
+            continue
+        else:
+            body = render(blocks(text))
+            if kind == "reference":
+                side = reference_side(rel, root, lang)
+                meta.setdefault("kicker", W["ref"])
+        page = page_html(rel, meta, unique_ids(diagrams(icons(rewrite_links(body, md, lang)))), current, side, lang)
+        p = dst / rel / "index.html" if rel else dst / "index.html"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(page, encoding="utf-8")
+        pages += 1
+    return pages
+
+
+def tabs(cur, base="../", root=MAN, lang="en"):
+    out = f'<nav class="tabs" aria-label="{WORDS[lang]["kinds"]}">'
+    for k in RECIPE_KINDS:
+        meta, _ = front((root / "recipes" / f"{k}.md").read_text(encoding="utf-8"))
+        out += f'<a href="{base}{k}/"{" aria-current=\"page\"" if k == cur else ""}>{icon(TAB_ICON[k], "ti")}{meta.get("tab", meta["title"])}</a>'
+    return out + "</nav>"
+
+
+def reference_side(rel, root=MAN, lang="en"):
+    """The reference's pages at the side, in the order of docs/manual/reference/index.md's list."""
+    W = WORDS[lang]
+    order = re.findall(r'(?:\]\(|href=")([\w-]+)\.md[)"]', (root / "reference" / "index.md").read_text(encoding="utf-8"))
+    here = rel.split("/")[1] if "/" in rel else ""
+    li = ""
+    for n in order:
+        meta, _ = front((root / "reference" / f"{n}.md").read_text(encoding="utf-8"))
+        cur = ' aria-current="page"' if n == here else ""
+        li += f'<li><a href="{"../" if here else ""}{n}/"{cur}>{inline(meta["title"])}</a></li>'
+    # folded on a phone (the list was two screens before the page's content: the 2026-11-13 review), open beside the
+    # page on a wide screen: opened before it's drawn there, so it never shows folded (manual.js keeps it in step)
+    return (f'<nav class="toc" aria-label="{W["the_ref"]}"><details><summary>{W["all_ref"]}<small>{len(order)}</small></summary>'
+            f'<h2>{W["ref"]}</h2><ul>{li}</ul></details></nav>'
+            '<script>if (matchMedia("(min-width: 821px)").matches) document.querySelector(".toc details").open = true;</script>')
+
+
+def page_rel(md, root=MAN):
+    """docs/manual/X/index.md and X.md are both the page manual/X/ ("" for the manual's first page)."""
+    rel = md.relative_to(root).with_suffix("").as_posix()
+    return "" if rel == "index" else rel[:-6] if rel.endswith("/index") else rel
+
+
+def icons(body):
+    """<img class="ic" src="…/icons/NAME.svg" alt=""> (it shows on GitHub too) as the icon's own SVG, in the text's color
+    (Phosphor's light weight, MIT, web/manual/icons)."""
+    def svg(m):
+        s = (WEB / "icons" / f"{m.group(1)}.svg").read_text(encoding="utf-8").strip()
+        return s.replace("<svg ", '<svg class="ic" aria-hidden="true" focusable="false" ', 1)
+    return re.sub(r'<img class="ic" src="[^"]*icons/([\w-]+)\.svg" alt="">', svg, body)
+
+
+def unique_ids(body):
+    """A heading's anchor once per page: a later one of the same name (a Good to know subhead named as a section
+    above it) gets -2, -3 .., so a link to the section lands on the section."""
+    seen = {}
+    def one(m):
+        n = seen[m.group(1)] = seen.get(m.group(1), 0) + 1
+        return f' id="{m.group(1)}"' if n == 1 else f' id="{m.group(1)}-{n}"'
+    return re.sub(r' id="([^"]+)"', one, body)
+
+def diagrams(body):
+    """<img class="diagram" src="…/media/NAME.svg" alt="…"> (it shows on GitHub too) as the drawing's own SVG in the
+    page, so its words are the page's fonts and stay sharp; the alt text its label for screen readers."""
+    def one(name, cls, label):                   # alt="": the text beside it says it all, so it isn't read
+        s = (MAN / "media" / f"{name}.svg").read_text(encoding="utf-8").strip()
+        a11y = f'role="img" aria-label="{label}"' if label else 'aria-hidden="true"'
+        return s.replace("<svg ", f'<svg class="{cls}" {a11y} ', 1)
+
+    def svg(m):                                  # NAME-tall.svg beside it: the phone's, top to bottom, one shown
+        if (MAN / "media" / f"{m.group(1)}-tall.svg").exists():
+            return one(m.group(1), "diagram wide", m.group(2)) + one(m.group(1) + "-tall", "diagram tall", m.group(2))
+        return one(m.group(1), "diagram", m.group(2))
+    return re.sub(r'<img class="diagram" src="[^"]*media/([\w-]+)\.svg" alt="([^"]*)">', svg, body)
+
+
+def rewrite_links(body, md, lang="en"):
+    """Links written between the Markdown files (../help.md, gestures.md#keep) as the site's pages. A Japanese page's
+    links go to the Japanese page where there is one (written as it), else to the English one (written ../X.md)."""
+    if lang == "ja":
+        rel = page_rel(md, JA)
+        up = "../" * (2 + (rel.count("/") + 1 if rel else 0))      # to the site's root
+
+        def fix_ja(m):
+            href = m.group(1)
+            path, _, frag = href.partition("#")
+            if re.match(r"[a-z]+:", href) or not path.endswith(".md"):
+                return m.group(0)
+            target = (md.parent / path).resolve()
+            if not target.is_relative_to(MAN):
+                return f'href="{REPO}/blob/main/{target.relative_to(SRC).as_posix()}{"#" + frag if frag else ""}"'
+            if target.is_relative_to(JA):
+                t = page_rel(target, JA)
+                url = "ja/manual/" + (t + "/" if t else "")
+            else:
+                t = page_rel(target)
+                url = "manual/" + (t + "/" if t else "")
+            return f'href="{up}{url}{"#" + frag if frag else ""}"'
+        body = re.sub(r'href="([^"]+)"', fix_ja, body)
+        return re.sub(r'src="(?:\.\./)*(?:img|media)/([\w.-]+\.(?:png|mp4))"', lambda m: f'src="{up}manual/media/{m.group(1)}"', body)
+    rel = page_rel(md)
+    depth = rel.count("/") + 1 if rel else 0
+
+    def fix(m):
+        href = m.group(1)
+        path, _, frag = href.partition("#")
+        if re.match(r"[a-z]+:", href) or not path.endswith(".md"):
+            return m.group(0)
+        target = (md.parent / path).resolve()
+        if not target.is_relative_to(MAN):         # the repo's own files (CHANGELOG.md, BUILDING.md): on GitHub
+            return f'href="{REPO}/blob/main/{target.relative_to(SRC).as_posix()}{"#" + frag if frag else ""}"'
+        t = page_rel(MAN / target.relative_to(MAN))
+        url = "../" * depth + (t + "/" if t else "")
+        return f'href="{url or "./"}{"#" + frag if frag else ""}"'
+    body = re.sub(r'href="([^"]+)"', fix, body)
+    # pictures written for GitHub (docs/img, docs/manual/media) are in the site's manual/media
+    return re.sub(r'src="(?:\.\./)*(?:img|media)/([\w.-]+\.png)"', lambda m: f'src="{"../" * depth}media/{m.group(1)}"', body)
+
+
+# ---- the check ---------------------------------------------------------------------------------------------------
+
+def check():
+    """Build into a scratch folder and check every page's links, anchors and pictures; every recipe's render."""
+    import tempfile
+    bad = []
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        build(out)
+        site = out / "manual"
+        for p in list(site.rglob("index.html")) + list((out / "ja" / "manual").rglob("index.html")):
+            t = p.read_text(encoding="utf-8")
+            ids = set(re.findall(r'id="([^"]+)"', t))
+            for img in re.findall(r"<img [^>]*>", t):
+                if 'alt="' not in img:
+                    bad.append(f"{p.relative_to(out)}: a picture without alt text: {img[:60]}")
+            for href in re.findall(r'(?:href|src)="([^"]+)"', t):
+                if re.match(r"[a-z]+:|data:", href):
+                    continue
+                path, _, frag = href.partition("#")
+                path = path.split("?v=")[0]
+                if not path:
+                    if frag and frag not in ids:
+                        bad.append(f"{p.relative_to(out)}: #{frag} isn't on the page")
+                    continue
+                if path.endswith(".mp4"):
+                    name = Path(path).stem
+                    if not (MAN / "renders" / f"{name}.omni").exists():
+                        bad.append(f"{p.relative_to(out)}: {name}.mp4 has no render (docs/manual/renders/{name}.omni)")
+                    continue
+                tgt = (p.parent / path).resolve()
+                if path.startswith("../") and not (str(tgt).startswith(str(site.resolve()))
+                                                   or str(tgt).startswith(str((out / "ja" / "manual").resolve()))):
+                    continue                   # the front pages, install/: outside the manual
+                if tgt.is_dir():
+                    tgt = tgt / "index.html"
+                if not tgt.exists():
+                    bad.append(f"{p.relative_to(out)}: {href}: nothing there")
+                elif frag and frag not in re.findall(r'id="([^"]+)"', tgt.read_text(encoding="utf-8")):
+                    bad.append(f"{p.relative_to(out)}: {href}: no #{frag} there")
+    for b in bad:
+        print("manual: " + b)
+    if bad:
+        raise SystemExit(f"manual: {len(bad)} problems")
+    print("manual: every link, anchor, picture and render checked")
+
+
+# ---- the recipes' screens and sounds -----------------------------------------------------------------------------
+
+def renders(only=None):
+    """Each docs/manual/renders/NAME.omni through the host: its shots NAME-0.png .. into docs/manual/media (twice the
+    size, sharp), its WAV leveled and made AAC into build/manual-audio/NAME.mp4 (macOS afconvert, or ffmpeg)."""
+    host = SRC / "build" / "host" / "omni_host"
+    if not host.exists():
+        raise SystemExit("no build/host/omni_host: run sh host/build_host.sh")
+    from PIL import Image    # noqa: E402  (the .venv's; only for the renders)
+    AUDIO.mkdir(parents=True, exist_ok=True)
+    tmp = SRC / "build" / "manual-renders"
+    for s in sorted((MAN / "renders").glob("*.omni")):
+        if only and s.stem not in only:
+            continue
+        o = tmp / s.stem
+        o.mkdir(parents=True, exist_ok=True)
+        for f in o.glob("*"):
+            f.unlink()
+        r = subprocess.run([str(host), str(s), str(o)], capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit(f"{s.name}: the host failed:\n{r.stdout}{r.stderr}")
+        for png in sorted(o.glob("*.png")):
+            Image.open(png).resize((480, 480), Image.NEAREST).save(MAN / "media" / png.name)
+        wav = o / f"{s.stem}.wav"
+        if not wav.exists():                           # screens only: nothing to hear in this one
+            print(f"render: {s.stem}: {len(list(o.glob('*.png')))} screens, no sound")
+            continue
+        level(wav, o / "level.wav")
+        mp4 = AUDIO / f"{s.stem}.mp4"
+        if shutil.which("afconvert"):
+            subprocess.run(["afconvert", "-f", "m4af", "-d", "aac", "-b", "160000", str(o / "level.wav"), str(mp4)], check=True)
+        else:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(o / "level.wav"), "-c:a", "aac", "-b:a", "160k",
+                            "-f", "mp4", str(mp4)], check=True)
+        print(f"render: {s.stem}: {len(list(o.glob('*.png')))} screens, {mp4.stat().st_size // 1024} KB")
+
+
+def _biquad(x, b0, b1, b2, a1, a2):
+    y, x1, x2, y1, y2 = [0.0] * len(x), 0.0, 0.0, 0.0, 0.0
+    for i, v in enumerate(x):
+        o = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2, x1, y2, y1 = x1, v, y1, o
+        y[i] = o
+    return y
+
+
+def loudness(chans, sr):
+    """Perceived loudness, LUFS (ITU BS.1770: the K-weighting's two stages, the channels' mean squares summed; one
+    block, no gating: the clips are short and steady). The deep bass counts less, as the ear hears it."""
+    k = math.tan(math.pi * 1681.97 / sr)                  # stage 1: a +4 dB shelf above ~1.7 kHz
+    vh, vb, q = 10 ** (4.0 / 20), 10 ** (4.0 / 40), 1 / math.sqrt(2)
+    a0 = 1 + k / q + k * k
+    s1 = ((vh + vb * k / q + k * k) / a0, 2 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0,
+          2 * (k * k - 1) / a0, (1 - k / q + k * k) / a0)
+    k = math.tan(math.pi * 38.13 / sr)                    # stage 2: a high-pass at ~38 Hz
+    a0 = 1 + k / 0.5 + k * k
+    s2 = (1.0, -2.0, 1.0, 2 * (k * k - 1) / a0, (1 - k / 0.5 + k * k) / a0)
+    total = 0.0
+    for c in chans:
+        y = _biquad(_biquad(c, *s1), *s2)
+        total += sum(v * v for v in y) / len(y)
+    return -0.691 + 10 * math.log10(max(total, 1e-12))
+
+
+def level(src, dst):
+    """The WAV at LEVEL_LUFS perceived loudness, raised only as far as its peaks stay under -1 dBFS."""
+    with wave.open(str(src)) as w:
+        p, a = w.getparams(), array("h", w.readframes(w.getnframes()))
+    n = p.nchannels
+    chans = [[v / 32768 for v in a[c::n]] for c in range(n)]
+    pk = max(1, max(abs(x) for x in a)) / 32768
+    g = min(10 ** ((LEVEL_LUFS - loudness(chans, p.framerate)) / 20), 10 ** ((-1 - 20 * math.log10(pk)) / 20))
+    with wave.open(str(dst), "wb") as w:
+        w.setparams(p)
+        w.writeframes(array("h", (int(round(max(-32768, min(32767, x * g)))) for x in a)).tobytes())
+
+
+def render_times(path):
+    """A render script's "# @ words" marks, at their times from the WAV's start (the host's own step lengths), to
+    write a recipe's listening times from."""
+    t, out, pend = None, [], None
+    for line in open(path):
+        s = line.strip()
+        if s.startswith("# @"):
+            pend = s[3:].strip()
+            continue
+        if not s or s.startswith("#"):
+            continue
+        w = s.split()
+        if w[0] == "wav":
+            t = 0.0
+            continue
+        if t is not None and pend is not None:
+            out.append((t, pend))
+            pend = None
+        d = {"wait": lambda: int(w[1]), "tap": lambda: 40, "tapkey": lambda: 90, "press": lambda: 2, "release": lambda: 2,
+             "turn": lambda: abs(int(w[2])) * (int(w[3]) if len(w) > 3 else 80)}.get(w[0], lambda: 0)()
+        if t is not None:
+            t += d / 1000
+    return out
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["--check"]:
+        check()
+    elif a[:1] == ["--renders"]:
+        renders(set(a[1:]) or None)
+    elif a[:1] == ["--times"]:
+        for f in a[1:]:
+            print(f)
+            for t, w in render_times(f):
+                print(f"  - {int(t) // 60}:{int(t) % 60:02d} {w}")
+    elif len(a) == 1:
+        build(Path(a[0]))
+    else:
+        sys.exit(__doc__)

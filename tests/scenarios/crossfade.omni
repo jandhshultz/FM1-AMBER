@@ -1,0 +1,168 @@
+# the pressure crossfade (v0.2): a scene key held is a fader into its scene. Drone I's cutoff (par7) shows
+# where the sound is: scene 1.1 at 700, the sound before it at 300. The pressure is where the sound heads; it
+# glides there no faster than the whole way in a Scene time (here 1.1 s: Setup 1 KNOB 3 at 24), after the
+# first 250 ms (a tap so far)
+set 71 24
+# drone I's cutoff at 700 (the starting sound's before 2026-11-08)
+set 7 700
+# Pitch lock off (on at start since 2026-10-19): these move the pitch
+set 74 0
+# bank 1 (a new FM-1 starts on the Presets, which are fixed)
+press SEL
+tapkey w8
+release SEL
+pressure w0 0
+tap PLAY
+wait 1500
+press SAVE
+tapkey w0
+release SAVE
+wait 300
+spin K2 -40
+wait 300
+expect par7 300
+# a light rest: nothing moves
+key w0 down
+pressure w0 5
+wait 400
+expect par7 300
+# half way in (pressure 64 of 127: ~52 %)
+pressure w0 64
+wait 800
+expect par7 >480
+expect par7 <540
+# let go, no SEL: back to where it was, at the same speed (Evan, 2026-10-30: SEL is what keeps it)
+key w0 up
+wait 1200
+expect par7 300
+expect scene_at -1
+# SEL tapped while it's held, half way: the blend kept there, as a gesture's; pressing on moves nothing, and the
+# let-go doesn't take it back
+key w0 down
+pressure w0 64
+wait 800
+tap SEL
+pressure w0 127
+wait 800
+expect par7 >480
+expect par7 <540
+key w0 up
+wait 1200
+expect par7 >480
+expect par7 <540
+expect scene_at -1
+# SEL + SAVE: undo, back to the sound before the blend, over the Scene time
+press SEL
+tap SAVE
+release SEL
+wait 1300
+expect par7 300
+# ... and again: forward to the blend
+press SEL
+tap SAVE
+release SEL
+wait 1300
+expect par7 >480
+expect par7 <540
+# back to before it, for what follows
+press SEL
+tap SAVE
+release SEL
+wait 1300
+expect par7 300
+# a tap (let go under half a second), however hard: there, over the Scene time (1.1 s), and stay
+key w0 down
+pressure w0 127
+wait 100
+key w0 up
+wait 1600
+expect par7 700
+expect scene_at 0
+# a relaxed tap (0.4 s, a light press): the scene too, to stay (Evan, 2026-10-18: it went BACK)
+spin K2 -40
+wait 300
+expect scene_at -1
+key w0 down
+pressure w0 40
+wait 400
+key w0 up
+wait 1600
+expect par7 700
+expect scene_at 0
+# pressed through (held near full for 0.3 s): taken, and it stays after letting go. Pressed hard at once it
+# glides in over the Scene time, not a jump (Evan, 2026-10-19)
+spin K2 -40
+wait 300
+expect scene_at -1
+key w0 down
+pressure w0 127
+wait 400
+expect par7 <450
+wait 1100
+expect par7 700
+key w0 up
+wait 1200
+expect par7 700
+expect scene_at 0
+# the finger lifting slowly, then let go: back all the same, to the sound before the press
+spin K2 -40
+wait 300
+key w0 down
+pressure w0 64
+wait 1000
+pressure w0 30
+wait 60
+pressure w0 0
+wait 40
+key w0 up
+wait 1200
+expect par7 300
+expect scene_at -1
+# a tap held past the crossfade's start (350 ms): undo goes back to the sound before the press, not to the
+# blend it had begun (the review, 2026-10-27)
+key w0 down
+pressure w0 100
+wait 350
+key w0 up
+wait 1600
+expect par7 700
+press SEL
+tap SAVE
+release SEL
+wait 1300
+expect par7 300
+# undo leaves the room's settings (Stereo) where they are
+tapkey w0
+wait 1600
+expect par7 700
+set 53 90
+press SEL
+tap SAVE
+release SEL
+wait 1300
+expect par7 300
+expect par53 90
+set 53 60
+# turning ALGORITHM (Movement, par75) while a scene switch is on its way: the switch lets go of it, and the
+# rest still lands (scene 1.2 stored with Movement 50 and cutoff 700; the sound at Movement 80, cutoff 300)
+spin K2 40
+wait 300
+press SAVE
+tapkey w1
+release SAVE
+wait 300
+spin K2 -40
+spin ALGO 30
+wait 300
+expect par75 80
+tap GLO
+spin K3 13
+tap HOME
+tapkey w1
+wait 400
+spin ALGO 10
+wait 200
+spin ALGO 5
+wait 7500
+expect par75 >90
+expect par7 700
