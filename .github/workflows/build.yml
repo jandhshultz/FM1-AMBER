@@ -20,10 +20,15 @@ jobs:
           sudo apt-get install -y python3-pil
 
       - name: Get Toolchain
-        run: ./tools/get_toolchain.sh
+        run: |
+          chmod +x ./tools/get_toolchain.sh
+          ./tools/get_toolchain.sh
 
       - name: Build Firmware
-        run: ./build.sh
+        run: |
+          chmod +x ./build.sh
+          chmod +x ./tools/*.sh ./tools/*.py 2>/dev/null || true
+          ./build.sh
 
       - name: Upload Firmware Artifact
         uses: actions/upload-artifact@v4
