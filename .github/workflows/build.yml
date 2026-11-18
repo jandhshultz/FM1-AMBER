@@ -15,7 +15,9 @@ jobs:
           git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK
 
       - name: Install Dependencies
-        run: sudo apt-get install -y python3-pil
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pil
 
       - name: Get Toolchain
         run: ./tools/get_toolchain.sh
