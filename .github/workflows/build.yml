@@ -18,7 +18,12 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pil python3-freetype
+          sudo apt-get install -y python3-pil python3-freetype curl
+
+      - name: Download Missing Font
+        run: |
+          mkdir -p assets/fonts
+          curl -L -o assets/fonts/BarlowSemiCondensed-SemiBold.ttf https://github.com/google/fonts/raw/main/ofl/barlowsemicondensed/BarlowSemiCondensed-SemiBold.ttf
 
       - name: Get Toolchain
         run: |
@@ -36,3 +41,4 @@ jobs:
         with:
           name: AMBER-Firmware
           path: build/*.fwsc
+          
