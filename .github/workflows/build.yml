@@ -15,14 +15,20 @@ jobs:
         run: |
           git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK
 
+      - name: Populate Missing Loader Files
+        run: |
+          mkdir -p firmware/loader
+          find ~/fw-AC79_AIoT_SDK -name "crt0_ldr.S" -exec dirname {} \; | head -n 1 | xargs -I {} cp -r {}/* firmware/loader/ || true
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pil python3-freetype curl
 
-      - name: Download Missing Font
+      - name: Download Required Fonts
         run: |
           mkdir -p assets/fonts
+          curl -L -o assets/fonts/BarlowSemiCondensed-Medium.ttf https://github.com/google/fonts/raw/main/ofl/barlowsemicondensed/BarlowSemiCondensed-Medium.ttf
           curl -L -o assets/fonts/BarlowSemiCondensed-SemiBold.ttf https://github.com/google/fonts/raw/main/ofl/barlowsemicondensed/BarlowSemiCondensed-SemiBold.ttf
 
       - name: Get Toolchain
@@ -41,4 +47,3 @@ jobs:
         with:
           name: AMBER-Firmware
           path: build/*.fwsc
-          
