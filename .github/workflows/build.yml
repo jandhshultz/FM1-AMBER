@@ -30,6 +30,7 @@ jobs:
           mkdir -p assets/fonts
           curl -L -o assets/fonts/BarlowSemiCondensed-Medium.ttf https://github.com/google/fonts/raw/main/ofl/barlowsemicondensed/BarlowSemiCondensed-Medium.ttf
           curl -L -o assets/fonts/BarlowSemiCondensed-SemiBold.ttf https://github.com/google/fonts/raw/main/ofl/barlowsemicondensed/BarlowSemiCondensed-SemiBold.ttf
+          curl -L -o assets/fonts/BarlowSemiCondensed-Bold.ttf https://github.com/google/fonts/raw/main/ofl/barlowsemicondensed/BarlowSemiCondensed-Bold.ttf
 
       - name: Get Toolchain
         run: |
