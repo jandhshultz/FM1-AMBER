@@ -11,9 +11,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Get JieLi SDK
+      - name: Configure Git and Get JieLi SDK
         run: |
-          git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK
+          git config --global http.postBuffer 524288000
+          git clone --depth 1 --branch AC79NN_SDK_V1.2.1_2023-12-13 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK || \
+          git clone --depth 1 https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git ~/fw-AC79_AIoT_SDK
 
       - name: Populate Missing Loader Files
         run: |
